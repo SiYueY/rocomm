@@ -1,0 +1,36 @@
+add_executable(rocomm_logging_basic_test logging/basic_test.cpp)
+target_link_libraries(rocomm_logging_basic_test PRIVATE rocomm::logging)
+target_compile_features(rocomm_logging_basic_test PRIVATE cxx_std_17)
+add_test(NAME rocomm_logging_basic_test COMMAND rocomm_logging_basic_test)
+
+add_executable(rocomm_logging_contract_test logging/contract_test.cpp)
+target_link_libraries(rocomm_logging_contract_test PRIVATE rocomm::logging)
+target_compile_features(rocomm_logging_contract_test PRIVATE cxx_std_17)
+add_test(NAME rocomm_logging_contract_test COMMAND rocomm_logging_contract_test)
+
+add_executable(rocomm_runtime_logging_test runtime_logging_test.cpp)
+target_link_libraries(rocomm_runtime_logging_test PRIVATE rocomm::runtime)
+target_compile_features(rocomm_runtime_logging_test PRIVATE cxx_std_17)
+add_test(NAME rocomm_runtime_logging_test COMMAND rocomm_runtime_logging_test)
+
+add_executable(rocomm_public_headers_test public_headers_test.cpp)
+target_link_libraries(rocomm_public_headers_test PRIVATE rocomm::runtime)
+target_compile_features(rocomm_public_headers_test PRIVATE cxx_std_17)
+add_test(NAME rocomm_public_headers_test COMMAND rocomm_public_headers_test)
+
+add_executable(rocomm_logging_macro_strip_test logging/macro_strip_test.cpp)
+target_link_libraries(rocomm_logging_macro_strip_test PRIVATE rocomm_core)
+target_compile_features(rocomm_logging_macro_strip_test PRIVATE cxx_std_17)
+target_compile_definitions(rocomm_logging_macro_strip_test PRIVATE ROCOMM_LOGGING_COMPILED_LEVEL=6)
+add_test(NAME rocomm_logging_macro_strip_test COMMAND rocomm_logging_macro_strip_test)
+
+if(TARGET rocomm::logging_spdlog)
+    target_compile_definitions(rocomm_runtime_logging_test PRIVATE ROCOMM_HAS_SPDLOG_BACKEND=1)
+endif()
+
+if(TARGET rocomm::logging_spdlog)
+    add_executable(rocomm_logging_spdlog_test logging/spdlog_test.cpp)
+    target_link_libraries(rocomm_logging_spdlog_test PRIVATE rocomm::logging_spdlog)
+    target_compile_features(rocomm_logging_spdlog_test PRIVATE cxx_std_17)
+    add_test(NAME rocomm_logging_spdlog_test COMMAND rocomm_logging_spdlog_test)
+endif()

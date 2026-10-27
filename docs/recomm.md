@@ -706,6 +706,7 @@ optional Diagnostic
 class Status {
 public:
     Status() noexcept;
+    explicit Status(StatusCode code) noexcept;
 
     StatusCode code() const noexcept;
     bool ok() const noexcept;
@@ -728,6 +729,8 @@ zero diagnostic allocation
 code != Ok
 optional immutable Diagnostic
 ```
+
+code-only 构造不分配内存，diagnostic 为 nullptr；传入 Ok 等价于默认成功 Status。noexcept 错误路径必须能够只保留 StatusCode；可选 Diagnostic allocation 失败时省略 Diagnostic，不得丢失错误码或 terminate。
 
 ---
 
@@ -796,9 +799,7 @@ std::shared_ptr<const Diagnostic>
 
 ### 2.1.5 Status move / noexcept
 
-Status 的正常移动应保持轻量。
-
-Phase 0 Public Header Finalization 应明确：
+Status 的 copy / move 均为 noexcept、无 allocation 的轻量共享 / 转移操作：
 
 ```text
 copy ctor
@@ -807,9 +808,9 @@ move ctor
 move assignment
 ```
 
-的 exact `noexcept` contract。
+均不得深复制 Diagnostic。Logging control completion 必须能够在资源耗尽时保存、复制和返回原始失败 Status。
 
-但冻结语义是：
+冻结语义是：
 
 ```text
 move 不改变 logical Status value
@@ -3845,7 +3846,7 @@ RoComm 必须统一：
 try {
     user_callable();
 } catch (...) {
-    // best-effort Critical log
+    // Optional proven nonblocking emergency diagnostic; never wait on Logger/RawLog.
     std::terminate();
 }
 ```
@@ -4091,7 +4092,7 @@ public:
 
     Status Stop() noexcept;
 
-    Logger GetLogger(
+    Result<Logger> GetLogger(
         std::string_view category) const;
 
     ~Runtime() noexcept;
@@ -4305,7 +4306,7 @@ logical RuntimeState == Stopped
 ```text
 已经运行中的 callback
 已经运行中的 Handler / continuation
-阻塞中的 custom LogSink
+阻塞中的 custom LoggingBackend
 ```
 
 尚未返回。
@@ -4357,7 +4358,7 @@ Stop();
 如果 shutdown timeout：
 
 ```text
-best-effort Error/Critical log
+不执行可能阻塞的普通日志输出；可选 nonblocking emergency diagnostic
 Runtime wrapper 可以销毁
 必要 internal state 继续存活
 ```
@@ -4365,7 +4366,7 @@ Runtime wrapper 可以销毁
 直到：
 
 ```text
-in-flight execution / blocking sink
+in-flight execution / blocking Backend
 ```
 
 自然返回。
@@ -4893,7 +4894,7 @@ RoComm 对外暴露的 user task
 try {
     user_callable();
 } catch (...) {
-    // best-effort Critical log
+    // Optional proven nonblocking emergency diagnostic; never wait on Logger/RawLog.
     std::terminate();
 }
 ```
@@ -5080,532 +5081,47 @@ cancelled_remote
 
 ---
 
-## 3.21 Logging
+## 3.21 Logging Integration Contract
 
-Logging 是 RoComm Core 正式基础组件。
+Logging 子系统的公共 API、Backend SPI、Admission、Queue、统计与完整测试矩阵，以 [Logging V1 设计](logging.md) 为唯一权威定义。本节只冻结主架构的集成边界，不再定义 LoggingBackend、内置 Sink 或第二套 Logging API。
 
-领域：
-
-```text
-rocomm::logging
-```
-
-不是：
+本文中遗留的 PascalCase API 示例遵循 Logging 文档的 naming alignment：实际手写
+C++17 API 使用 snake_case，且不为旧拼写保留 wrapper。该迁移不改变 Runtime 与
+Logging 的任何语义契约。
 
 ```text
-RuntimeConfig 中几个临时 logging 字段
+1. 每个 Runtime 拥有独立 LoggingContext；无 process-global mutable logger/registry。
+2. Core 与 Middleware 通过统一 Logger 使用 category/severity filtering。
+3. disabled LogLazy / macros 不执行 message builder；compile-time stripped macros
+   不求值 logger expression 与 message expression。
+4. Public logging headers 不泄漏第三方 logging 类型。
+5. Logging failure 不改变 Topic / Service operation 的 Status。
+6. 默认 Async 的正常 dispatch 不在通信线程执行 Backend output I/O；
+   emergency RawLog 可以在 caller 输出 stderr，不保证最大阻塞时间。
+7. Runtime::Create 先创建 LoggingContext，再初始化 Executor / Middleware。
+   显式 Backend 或 logging 配置失败导致 Create 失败，不 silent fallback。
+8. Middleware 在 Initialize 取得长期使用的 Logger，shutdown 复用该 Logger；
+   不管理 Backend、queue、worker 或 LoggingContext lifecycle。
+9. Runtime shutdown 在 Middleware / Executor cleanup 后才关闭 Logging。
+   它们的正常 cleanup 期间 Logging 保持 Running；deadline 耗尽时仍须发起
+   Logging shutdown，允许 backing deferred cleanup，不延长 Runtime deadline。
+10. Runtime::Stop 使用剩余 deadline 等待 Logging shutdown。
+    未 quiescent 返回 Timeout；deadline 内完成且无更早 cleanup error 时，
+    传播 Logging final Status；已有 primary error 时保留它，并将 Logging
+    failure 作为 secondary diagnostic。Diagnostic allocation 失败可省略文字，
+    不能把错误改成 Ok；本次 Timeout 不覆盖 Logging 保存的最终结果。
+11. Logging timeout 不 unsafe terminate 执行线程，不提前释放 backing。
+12. Enabled 是 advisory；admission 与 Running→Stopping 的线性化决定接受。
+    Category filtering、admission ownership 与 accepted 计数不可混为一谈。
+13. fatal / recursion / logging failure 有独立 RawLog emergency 边界。
+    user callable fail-fast 不调用普通 Logger，也不等待可能阻塞的 RawLog；
+    仅可选尝试已证明 nonblocking 的 emergency diagnostic，随后 terminate。
+14. Logging V1 不宣称 hard-real-time safe。
 ```
 
----
+Runtime 与 MiddlewareInitContext 的 GetLogger 均返回 `Result<Logger>`，不得吞掉 category validation / allocation / lifecycle failure。有效 wrapper 委托所属 LoggingContext；default/moved-from wrapper 返回 InvalidState；Context Stopping/Stopped 返回 RuntimeStopped；config-disabled 但 Running 的 Context 返回成功 disabled Logger。Middleware 仅在 Initialize 使用该获取接口。
 
-### 3.21.1 Logging 目标
-
-必须支持：
-
-```text
-Runtime-local configuration
-category-based filtering
-多个 sink
-同步 / 异步模式
-bounded async queue
-明确 overflow policy
-source location
-flush
-custom sink
-Middleware / Core 共用
-无 exception propagation
-```
-
-Logging：
-
-> 不改变通信 operation 的 Status 语义。
-
----
-
-### 3.21.2 LogLevel
-
-```cpp
-enum class LogLevel : std::uint8_t {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-    Critical,
-    Off,
-};
-```
-
----
-
-### 3.21.3 SourceLocation
-
-C++17 不使用：
-
-```cpp
-std::source_location
-```
-
-定义：
-
-```cpp
-struct SourceLocation {
-    const char* file = nullptr;
-    const char* function = nullptr;
-    std::uint32_t line = 0;
-};
-```
-
-可由：
-
-```text
-__FILE__
-__func__
-__LINE__
-```
-
-构造。
-
----
-
-### 3.21.4 LogRecord
-
-概念：
-
-```cpp
-struct LogRecord {
-    Timestamp timestamp;
-    LogLevel level;
-
-    std::string category;
-    std::string message;
-
-    SourceLocation source;
-    std::thread::id thread_id;
-};
-```
-
-异步 logging 必须拥有：
-
-```text
-category
-message
-```
-
-storage。
-
-不得异步保存 caller-owned：
-
-```text
-string_view
-format arg reference
-```
-
----
-
-### 3.21.5 LogSink
-
-```cpp
-class LogSink {
-public:
-    virtual ~LogSink() = default;
-
-    virtual void
-    Write(const LogRecord&) noexcept = 0;
-
-    virtual void
-    Flush() noexcept = 0;
-};
-```
-
-Sink 不允许 exception 穿过 Logging boundary。
-
----
-
-### 3.21.6 Built-in sinks
-
-V1 至少提供：
-
-```text
-ConsoleSink
-FileSink
-RotatingFileSink
-NullSink
-```
-
-RotatingFileSink 至少支持：
-
-```text
-maximum file size
-maximum retained file count
-```
-
-具体 rotation 算法可以调优。
-
----
-
-### 3.21.7 LoggingMode
-
-```cpp
-enum class LoggingMode {
-    Synchronous,
-    Asynchronous,
-};
-```
-
----
-
-### 3.21.8 LogOverflowPolicy
-
-```cpp
-enum class LogOverflowPolicy {
-    DropNewest,
-    DropOldest,
-    Block,
-};
-```
-
-默认：
-
-```text
-DropNewest
-```
-
-避免 logging queue 对通信路径产生无界阻塞。
-
-`Block` 必须由用户显式选择。
-
----
-
-### 3.21.9 LoggingConfig
-
-概念：
-
-```cpp
-class LoggingConfig {
-public:
-    LoggingConfig&
-    SetDefaultLevel(
-        LogLevel level);
-
-    LoggingConfig&
-    SetCategoryLevel(
-        std::string category,
-        LogLevel level);
-
-    LoggingConfig&
-    AddSink(
-        std::shared_ptr<LogSink> sink);
-
-    LoggingConfig&
-    SetMode(
-        LoggingMode mode);
-
-    LoggingConfig&
-    SetQueueCapacity(
-        std::size_t capacity);
-
-    LoggingConfig&
-    SetOverflowPolicy(
-        LogOverflowPolicy policy);
-
-    LoggingConfig&
-    SetFlushLevel(
-        LogLevel level);
-};
-```
-
-exact header 可在 Public Header Finalization 细调，但上述能力是 V1 contract。
-
----
-
-### 3.21.10 Category hierarchy
-
-正式 category 至少包含：
-
-```text
-rocomm
-rocomm.runtime
-rocomm.topic
-rocomm.service
-rocomm.execution
-rocomm.async
-rocomm.transport
-rocomm.type
-rocomm.middleware
-rocomm.fastdds
-rocomm.ros2
-rocomm.zenoh
-rocomm.grpc
-```
-
-Category override 使用：
-
-> **longest matching dot-prefix**
-
-例如：
-
-```text
-default = Info
-rocomm = Debug
-rocomm.fastdds = Trace
-```
-
-则：
-
-```text
-rocomm.fastdds.discovery
-→ Trace
-```
-
----
-
-### 3.21.11 Logger
-
-概念：
-
-```cpp
-class Logger {
-public:
-    bool Enabled(
-        LogLevel level) const noexcept;
-
-    void Log(
-        LogLevel level,
-        std::string_view message,
-        SourceLocation source = {}) const noexcept;
-
-    void Flush() const noexcept;
-};
-```
-
-Runtime：
-
-```cpp
-auto logger =
-    runtime.GetLogger(
-        "rocomm.my_component");
-```
-
----
-
-### 3.21.12 Runtime-local ownership
-
-每个 RuntimeState 持有：
-
-```text
-LoggingContext
-```
-
-禁止使用：
-
-```text
-global mutable logger singleton
-```
-
-因此多个 Runtime 可分别使用：
-
-```text
-不同 level
-不同 sink
-不同输出文件
-不同 test capture
-```
-
----
-
-### 3.21.13 Runtime Create 期间日志
-
-`Runtime::Create()` 必须先建立：
-
-```text
-LoggingContext
-```
-
-然后：
-
-```text
-Middleware Initialize
-Route validation
-Executor startup
-Type binding resolution
-```
-
-才能统一使用 Runtime logging。
-
-LoggingConfig 无效：
-
-```text
-Runtime::Create()
-→ failure
-```
-
----
-
-### 3.21.14 日志格式化位置
-
-V1 冻结：
-
-> **message formatting 发生在调用线程，并且只在 `Enabled(level)` 成功之后发生。**
-
-Async：
-
-```text
-caller
-  ↓
-Enabled(level)
-  ↓
-format final message
-  ↓
-materialize owned LogRecord
-  ↓
-bounded queue
-  ↓
-logging worker
-  ↓
-LogSink
-```
-
-V1 不实现：
-
-```text
-queue raw format args
-后台 type-erased formatting
-```
-
-避免：
-
-```text
-format arg lifetime
-复杂 formatter ownership
-额外 type-erasure layer
-```
-
----
-
-### 3.21.15 Hot-path logging
-
-成功通信 hot path 不应无条件格式化：
-
-```cpp
-if (logger.Enabled(LogLevel::Debug)) {
-    // formatting / message construction
-}
-```
-
-disabled log path 应保持低成本。
-
----
-
-### 3.21.16 Sink blocking
-
-Synchronous mode：
-
-```text
-LogSink::Write()
-```
-
-允许阻塞当前调用线程。
-
-这是用户主动选择 synchronous logging 的代价。
-
-Asynchronous mode：
-
-```text
-Logger::Log()
-```
-
-不得直接执行 Sink I/O。
-
-Sink I/O 只在 logging worker。
-
----
-
-### 3.21.17 Custom Sink contract
-
-自定义：
-
-```text
-Write()
-Flush()
-```
-
-不得无限阻塞。
-
-但 RoComm 无法安全强杀违反该 contract 的第三方 Sink。
-
-Stop 等待 logging worker 超时：
-
-```text
-Stop() → Timeout
-```
-
-RoComm：
-
-```text
-停止等待
-不 unsafe terminate sink thread
-保留必要 backing state
-```
-
-直到 sink 返回。
-
-这与 Runtime quiescence 模型一致。
-
----
-
-### 3.21.18 Logging failure
-
-Sink failure：
-
-```text
-不能改变 Publish Status
-不能改变 AsyncCall Status
-不能改变 ResponseSender::Send Status
-不能抛 exception 越过 Logging boundary
-```
-
-Built-in sink 应维护：
-
-```text
-logging error counter
-```
-
-Error / Critical 可以尝试：
-
-```text
-emergency stderr fallback
-```
-
-但必须防：
-
-```text
-recursive logging
-```
-
----
-
-### 3.21.19 Logging 与 fail-fast
-
-以下场景在 terminate 前 best-effort 记录：
-
-```text
-user callback throws
-Handler throws
-ResponseHandler throws
-Future continuation throws
-internal unrecoverable invariant failure
-```
-
-推荐：
-
-```text
-Critical
-```
-
-但：
-
-> Logging failure 不能阻止最终 `std::terminate()`。
+Logger 是持有 LoggingState lifetime 的 handle；已有 Logger 在 wrapper 销毁或 stop 后仍 memory-safe，但不能延长 Running lifecycle。
 
 ---
 
@@ -5729,7 +5245,7 @@ class MiddlewareInitContext {
 public:
     MiddlewareId id() const noexcept;
 
-    Logger GetLogger(
+    Result<Logger> GetLogger(
         std::string_view category) const;
 
     // other exact accessors:
@@ -6529,12 +6045,14 @@ rocomm/
 │       │   ├── logger.hpp
 │       │   ├── log_level.hpp
 │       │   ├── log_record.hpp
-│       │   ├── log_sink.hpp
+│       │   ├── source_location.hpp
+│       │   ├── logging_backend.hpp
 │       │   ├── logging_config.hpp
-│       │   ├── console_sink.hpp
-│       │   ├── file_sink.hpp
-│       │   ├── rotating_file_sink.hpp
-│       │   └── null_sink.hpp
+│       │   ├── logging_context.hpp
+│       │   ├── logging_stats.hpp
+│       │   ├── macros.hpp
+│       │   ├── text/                  # 见 logging.md
+│       │   └── backends/              # 见 logging.md
 │       │
 │       ├── capability/
 │       │   ├── descriptor.hpp
@@ -7882,8 +7400,8 @@ Future continuation throws
 必须：
 
 ```text
-best-effort Critical log
-std::terminate()
+optional proven nonblocking emergency diagnostic
+std::terminate()（不等待普通 Logger 或可能阻塞的 RawLog）
 ```
 
 不得：
@@ -8013,7 +7531,7 @@ running callback
 blocked callback
 blocked Handler
 blocked continuation
-blocked custom LogSink
+blocked custom LoggingBackend
 Endpoint destruction during Stop
 ```
 
@@ -8032,52 +7550,22 @@ Stop == Timeout
 
 ---
 
-## 6.22 Logging Tests
+## 6.22 Logging Integration Tests
 
-必须覆盖：
+Logging 子系统的完整验收以 [logging.md §6](logging.md#6-验证标准性能契约与冻结边界) 为准。主架构集成测试验证：
 
 ```text
-default level
-
-category hierarchy
-
-longest-prefix override
-
+Logging 先于 Executor / Middleware 初始化
+Runtime / Middleware GetLogger 的 Result 错误传播
+Middleware Initialize 获取 Logger，Shutdown 复用已有 Logger
+Middleware / Executor cleanup 期间 Logging Running
+Logging 最后 shutdown，使用 Runtime 剩余 deadline
+Logging Timeout → Runtime Stop Timeout，backing 安全延迟释放
+Backend control failure 不被误报成成功
+Logging failure 不改变通信 Status
 Runtime-local isolation
-
-ConsoleSink
-FileSink
-RotatingFileSink
-NullSink
-custom Sink
-
-Synchronous mode
-
-Asynchronous mode
-
-bounded queue
-
-DropNewest
-
-DropOldest
-
-Block
-
-caller-side formatting
-
-async worker only performs Sink I/O
-
-disabled log path
-
-Flush
-
-Runtime Stop logging flush
-
-Stop timeout with blocked Sink
-
-Sink failure does not change communication Status
-
-Critical log before fail-fast
+late Logger memory safety，停止后不调用 Backend
+user callable fail-fast 不等待 Sync Backend / Async Block / blocking RawLog
 ```
 
 ---
@@ -8470,7 +7958,7 @@ malformed traits
 | `ServiceErrorMode` | Portable / NativeCompatible Service error wire semantics |
 | `LoggingContext` | Runtime-local logging state |
 | `Logger` | Runtime-bound logging frontend |
-| `LogSink` | 日志输出接口 |
+| `LoggingBackend` | 唯一 Public Backend SPI，见 logging.md |
 | `quiescent` | 所有已开始的 user invocation 均已退出的状态 |
 
 ---
@@ -8750,15 +8238,17 @@ Enabled(level)
    ↓
 caller-side formatting
    ↓
+authoritative admission
+   ↓
 owned LogRecord
    ↓
-sync Sink
+sync Backend dispatch
 or
 bounded async queue
    ↓
 logging worker
    ↓
-Sink
+LoggingBackend
 ```
 
 ---
@@ -8807,9 +8297,9 @@ RoComm V1 正式遵循以下原则：
 
 > **MessageFrame 是 logically immutable、caller-independent owned frame，可安全支持异步 Middleware 与 fan-out；lazy serialization cache 必须线程安全且不改变 logical message。**
 
-> **用户 callback、Handler、ResponseHandler 和 Future continuation 不允许异常穿越 RoComm invocation boundary；异常会 best-effort Critical log 后 fail-fast。**
+> **用户 callback、Handler、ResponseHandler 和 Future continuation 不允许异常穿越 RoComm invocation boundary；异常直接 fail-fast，仅可选执行已证明 nonblocking 的 emergency diagnostic。**
 
-> **Logging 是 Runtime-local Core component；formatting 在调用线程完成，异步 worker 只处理 bounded queue 后的 Sink I/O。**
+> **Logging 是 Runtime-local Core component；调用线程构造 owned message，正常 Async dispatch 的 Backend I/O 在 worker 执行；emergency RawLog 是例外。完整契约以 logging.md 为准。**
 
 > **RoComm 不使用 `detail/internal/impl` 作为通用内部 namespace；内部实现必须归属于真实领域。**
 

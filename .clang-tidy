@@ -1,0 +1,13 @@
+Checks: >
+  -*,
+  bugprone-use-after-move,
+  bugprone-narrowing-conversions,
+  performance-unnecessary-copy-initialization,
+  performance-move-const-arg,
+  modernize-use-override,
+  modernize-use-nullptr,
+  readability-braces-around-statements,
+  cppcoreguidelines-pro-type-cstyle-cast
+WarningsAsErrors: '*'
+HeaderFilterRegex: '^(include|src)/rocomm/.*'
+FormatStyle: file

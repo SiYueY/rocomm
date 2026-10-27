@@ -1,0 +1,3 @@
+add_executable(rocomm_logging_benchmark logging_benchmark.cpp)
+target_link_libraries(rocomm_logging_benchmark PRIVATE rocomm::logging)
+target_compile_features(rocomm_logging_benchmark PRIVATE cxx_std_17)

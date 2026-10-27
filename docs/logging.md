@@ -3,15 +3,27 @@
 **Project:** RoComm — Robotics Communication Runtime  
 **Module:** `rocomm::logging`  
 **Language:** C++17  
-**Architecture Status:** **FROZEN — V1 Design Baseline**  
+
+**Architecture:** **FROZEN**
 **Semantic Contract:** **FROZEN**  
 **Concurrency Model:** **FROZEN**  
-**Backend SPI Semantic Model:** **FROZEN**  
-**Exact Public C++ Headers:** **HEADER/API FINALIZATION REQUIRED**
+**Backend SPI Semantics:** **FROZEN**
+**Runtime Integration:** **FROZEN**
+**Public Header/API Contract:** **FROZEN — V1 Implementation Baseline**
+**Internal Data Structures / Algorithms:** **OPEN**
 
-本文档定义 RoComm Logging V1 的公共接口模型、Runtime-local 生命周期、Category 与过滤语义、同步/异步执行模型、有界队列、Backend SPI、spdlog 集成、文本输出、RawLog、错误隔离、Runtime 集成、工程结构、测试标准以及 V2 NativeBackend 的演进边界。
+本文档定义 RoComm Logging V1 的公共 API、Runtime-local 生命周期、Category 与过滤模型、同步/异步执行语义、有界队列及 Overflow、Admission、Flush/Shutdown、Backend SPI、spdlog 集成、文本输出、RawLog、Runtime 集成、工程结构、测试标准以及 V2 NativeBackend 的演进边界。
 
-Logging 已从《RoComm V1 架构与接口设计》中拆分为独立模块。主架构只保留 Logging Integration Contract；本文是 Logging 子系统自身的正式设计基线。
+Logging 已从《RoComm V1 架构与接口设计》中拆分为独立模块。RoComm 主架构只保留 Logging Integration Contract；本文是 Logging 子系统的正式 V1 Implementation Baseline。
+
+## API naming alignment
+
+本文早期 code block 中出现的 `Create`、`GetLogger`、`SetCategoryLevel`、`LogLazy`
+等 PascalCase 名称，只表示对应的 V1 semantic operation。项目采用
+`docs/cpp_coding_guidelines.md` 后，所有手写函数和成员函数统一以 snake_case
+交付：`create`、`get_logger`、`set_category_level`、`log_lazy` 等。该迁移只改变
+public spelling，不引入 compatibility wrapper，也不改变本文冻结的 admission、
+lifecycle、overflow、flush、shutdown、timeout 或 Backend SPI 语义。
 
 ---
 
@@ -19,7 +31,7 @@ Logging 已从《RoComm V1 架构与接口设计》中拆分为独立模块。�
 
 ## 1.1 模块定位
 
-RoComm Logging 是 RoComm Runtime 的基础可观测性组件。
+RoComm Logging 是 RoComm Runtime 的基础可观测性 primitive。
 
 它负责：
 
@@ -36,16 +48,19 @@ runtime category filtering
 
 LoggingContext
 
+log admission
 synchronous dispatch
 asynchronous dispatch
 
 bounded queue
 overflow policy
 
-Backend lifecycle
+Flush / Shutdown
+timeout / quiescence
 
-Flush
-Shutdown
+LoggingBackend SPI
+
+SpdlogBackend
 
 statistics
 
@@ -68,7 +83,7 @@ Audit framework
 Crash dump framework
 ```
 
-这些能力未来如果需要，应分别设计独立模块，而不能继续向 Logging 内部堆叠。
+未来如果需要 Metrics、Tracing 或实时事件记录，应分别定义独立 primitive，而不是继续扩张普通 Logging。
 
 核心原则：
 
@@ -87,30 +102,40 @@ RoComm 主架构只依赖以下 Logging Integration Contract：
 
 3. Logging 支持 Category / Severity filtering。
 
-4. disabled logging 不执行日志 message expression。
+4. disabled logging 不执行 message expression。
 
-5. Public API 不泄漏第三方 logging 类型。
+5. Logging Public API 不泄漏第三方 logging 类型。
 
 6. Logging failure 不修改 Topic / Service operation 的 Status。
 
-7. 默认异步 Logging 不在通信线程执行 Sink / output I/O。
+7. 默认异步 Logging 的正常 dispatch 不在通信线程执行 Backend output I/O；
+   emergency RawLog 允许在 caller 直接输出 stderr，且不承诺最大阻塞时长。
 
 8. Runtime::Stop() 统一管理 Logging lifecycle。
 
 9. fatal / recursion / logging subsystem failure
-   必须存在独立 RawLog fallback。
+   必须存在独立 emergency 边界；普通故障使用 RawLog，
+   必须 fail-fast 的路径仅可选 nonblocking diagnostic（§5.12）。
 
 10. Logging shutdown timeout 不通过 unsafe thread termination
-    强制终止 Backend 或调用线程。
+    强制结束 Backend 或调用线程。
 
-11. Runtime shutdown 时 Logging 最后关闭，
-    Middleware / Executor shutdown 期间仍可正常记录日志。
+11. Runtime shutdown 时 Logging 最后关闭。
+    Middleware / Executor shutdown 期间仍可以正常记录日志。
+
+12. Logging V1 不宣称 hard-real-time safe。
+
+13. Logger::Enabled() 是 advisory fast path，
+    生命周期 correctness 最终由 LoggingContext admission 决定。
+
+14. 成功 log admission 与 Running → Stopping
+    必须存在唯一可定义的线性化关系。
 ```
 
-以下实现和接口细节全部属于本文：
+以下内容全部由本文定义，而不再进入主架构：
 
 ```text
-Logger
+Logger exact API
 LogRecord
 
 LoggingConfig
@@ -119,10 +144,15 @@ LoggingContext
 CategoryLevels
 CategoryEntry
 
-AsyncQueue
-Overflow
+Admission semantics
 
-Backend SPI
+AsyncQueue
+Overflow semantics
+
+Flush barrier
+Shutdown completion
+
+LoggingBackend SPI
 
 TextFormatter
 TextBackendConfig
@@ -131,15 +161,16 @@ SpdlogBackend
 
 RawLog
 
-Logging tests
-V2 NativeBackend
+Logging test matrix
+
+V2 NativeBackend boundary
 ```
 
 ---
 
-## 1.3 V1 / V2 总体路线
+## 1.3 设计路线
 
-Logging 采用：
+RoComm Logging 采用：
 
 > **RoComm-owned frontend + Runtime-local logging runtime + narrow replaceable backend。**
 
@@ -154,9 +185,14 @@ LoggingContext
 
 Category policy
 
-Sync dispatch
+Admission gate
+
+Synchronous dispatch
+
 AsyncQueue
 Async writer
+
+Flush / Shutdown control path
 
 RawLog
 TextFormatter
@@ -181,13 +217,13 @@ V2 必须直接复用 V1：
 
 ```text
 Logger
-
 LogRecord
 
 LoggingConfig
 LoggingContext
 
 Category filtering
+Admission semantics
 
 Sync / Async dispatch
 
@@ -210,7 +246,7 @@ Backend Contract Tests
 
 因此：
 
-> **V2 的主要新增内容是 NativeBackend，而不是第二套 Logging Runtime。**
+> **V2 的核心新增内容是 NativeBackend，而不是第二套 Logging Runtime。**
 
 ---
 
@@ -228,10 +264,10 @@ Application / RoComm Core / Middleware
        Runtime Category filtering
                  │
                  ▼
-          message construction
+        LoggingContext Admission
                  │
                  ▼
-              LogRecord
+       owned message / LogRecord
                  │
                  ▼
           LoggingContext
@@ -247,7 +283,7 @@ Application / RoComm Core / Middleware
           └──────┬──────┘
                  │
                  ▼
-       Backend invocation guard
+       BackendInvocationGuard
                  │
                  ▼
           LoggingBackend
@@ -260,28 +296,27 @@ Application / RoComm Core / Middleware
 Emergency path：
 
 ```text
-logging recursion
-backend failure
+Backend recursion
+logging unavailable
 allocation failure
+Backend failure
 late teardown
-fatal invariant
+ordinary invariant diagnostic
         │
         ▼
       RawLog
         │
         ▼
-low-level stderr output
+ low-level stderr output
 ```
 
 ---
 
 ## 1.5 四层职责
 
-Logging V1 划分为四个明确层次。
+### 1.5.1 Logger Frontend
 
-### Logger Frontend
-
-负责：
+Logger 负责：
 
 ```text
 Category identity
@@ -297,34 +332,48 @@ LogLazy()
 logging macros
 ```
 
-不负责：
+Logger 不负责：
 
 ```text
+Runtime lifecycle ownership
+
+Admission linearization
+
 queue
-writer
+
+worker
+
 Backend lifecycle
-console
-file
+
+file / console
+
 rotation
+
+Flush ownership
+
+Shutdown ownership
 ```
 
 ---
 
-### LoggingContext
+### 1.5.2 LoggingContext
 
-负责：
+LoggingContext 负责：
 
 ```text
 Runtime-local ownership
 
-lifecycle/admission state
+lifecycle / admission state
 
 CategoryLevels
 CategoryEntry registry
 
 global filtering
 
-sync / async dispatch
+admission linearization
+
+sync dispatch
+async dispatch
 
 AsyncQueue
 
@@ -336,29 +385,29 @@ Backend invocation serialization
 
 Backend recursion boundary
 
-Flush
+Flush barrier
 
-Shutdown
+Shutdown completion
 
 timeout
 
 statistics
 ```
 
-它是 Logging module 的 Runtime 核心。
+LoggingContext 是整个 Logging module 的 Runtime 核心。
 
 ---
 
-### LoggingBackend
+### 1.5.3 LoggingBackend
 
-负责：
+LoggingBackend 负责：
 
 ```text
 消费 LogRecord
 
 backend-specific rendering
 
-backend-specific routing
+backend-specific output routing
 
 secondary output filtering
 
@@ -366,28 +415,32 @@ console / file / rotation
 
 backend-specific I/O
 
-backend-specific stats
+backend-specific statistics
 ```
 
-Backend 不拥有：
+LoggingBackend 不负责：
 
 ```text
 RoComm global category policy
+
+RoComm lifecycle admission
 
 RoComm async queue
 
 RoComm overflow semantics
 
 RoComm Runtime Stop semantics
+
+RoComm public Logger API
 ```
 
 ---
 
-### RawLog
+### 1.5.4 RawLog
 
 RawLog 完全独立于前三层。
 
-不得依赖：
+RawLog 不得依赖：
 
 ```text
 Logger
@@ -407,9 +460,9 @@ heap allocation
 
 ---
 
-## 1.6 为什么 AsyncQueue 属于 LoggingContext
+## 1.6 AsyncQueue 为什么属于 LoggingContext
 
-以下语义是 RoComm Logging 的公共契约：
+以下语义是 RoComm Logging contract：
 
 ```text
 Synchronous
@@ -419,7 +472,7 @@ DropNewest
 DropOldest
 Block
 
-Flush barrier
+Flush
 
 Shutdown
 
@@ -428,7 +481,7 @@ timeout
 statistics
 ```
 
-如果 queue/worker 属于：
+如果 Queue/Worker 属于：
 
 ```text
 SpdlogBackend
@@ -436,19 +489,21 @@ NativeBackend
 CustomBackend
 ```
 
-那么不同 Backend 将拥有不同：
+那么不同 Backend 很容易分别实现不同的：
 
 ```text
 queue
+
 overflow
+
 worker
+
 flush
+
 shutdown
 ```
 
-实现。
-
-这会导致：
+此时：
 
 ```text
 LoggingMode
@@ -457,48 +512,46 @@ Flush
 Shutdown
 ```
 
-实际上失去统一语义。
+就不再是真正统一的 RoComm 语义。
 
 因此正式冻结：
 
-> **Async dispatch、queue、overflow、worker lifecycle 属于 LoggingContext，而不是 LoggingBackend。**
+> **Async dispatch、Queue、Overflow、Worker lifecycle 属于 LoggingContext，而不是 LoggingBackend。**
 
-从 LoggingContext 看：
+从 LoggingContext 的角度：
 
 > **LoggingBackend 是同步、串行调用的 LogRecord consumer。**
 
-即便某个 Custom Backend 内部自行 buffering，它也只能把那部分机制视作自己的私有实现，不能改变 RoComm LoggingContext 已经承诺的公共语义。
+Custom Backend 即使内部再次 buffering，那也是 Backend 私有实现，不能改变 LoggingContext 已经承诺的公共语义。
 
 ---
 
 ## 1.7 为什么 V1 不使用 spdlog async runtime
 
-spdlog 自身已经拥有成熟的 asynchronous logging 和多种 overflow policy。
+spdlog 已经拥有成熟的 async logger 和 overflow policy。
 
-因此 RoComm 不使用 `spdlog::async_logger` 并不是因为 spdlog 功能不足。
-
-真正原因是：
+RoComm 不使用 `spdlog::async_logger` 不是因为第三方库缺少能力，而是因为：
 
 ```text
-RoComm 必须自己拥有 Runtime-local queue。
+RoComm 必须自己拥有 Runtime-local Queue。
 
-RoComm 必须统一定义 Overflow contract。
+RoComm 必须自己定义统一 Overflow contract。
 
-RoComm 必须统一统计 queue/drop metrics。
+RoComm 必须自己统计 queue/drop metrics。
 
 RoComm 必须统一 Flush / Shutdown / timeout。
 
 SpdlogBackend / NativeBackend / CustomBackend
-必须表现出相同的 async semantics。
+必须具有完全相同的 async semantics。
 
 不能让第三方 thread-pool ownership
-反向决定 RoComm Runtime lifecycle。
+决定 RoComm Runtime lifecycle。
 ```
 
-因此 V1 使用：
+因此 V1：
 
 ```text
-LoggingContext asynchronous runtime
+LoggingContext async runtime
 
         +
 
@@ -509,7 +562,7 @@ synchronous SpdlogBackend
 
 ## 1.8 Runtime-local 原则
 
-每一个 RoComm Runtime 拥有自己的 LoggingContext。
+每一个 Runtime 拥有自己的 LoggingContext。
 
 禁止依赖：
 
@@ -523,16 +576,16 @@ process-global mutable log level
 process-global mutable Backend
 ```
 
-两个 Runtime 可以独立拥有：
+两个 Runtime 可以拥有：
 
 ```text
 不同 default level
 
-不同 category override
+不同 category overrides
 
 不同 Backend
 
-不同文件
+不同日志文件
 
 不同 queue capacity
 
@@ -541,28 +594,96 @@ process-global mutable Backend
 不同测试 CaptureBackend
 ```
 
-关闭其中一个 Runtime：
+关闭 Runtime A：
 
 ```text
-不得影响另一个 Runtime
+不得影响 Runtime B
 ```
 
 ---
 
-## 1.9 热路径原则
+## 1.9 Hot path 与 correctness boundary 必须分离
 
-disabled logging：
+`Logger::Enabled()` 是：
 
 ```text
-不执行 message expression
+fast-path advisory check
+```
 
-不分配 heap
+它用于：
+
+```text
+调用方显式 if (logger.Enabled(...))
+
+LogLazy()
+
+logging macros
+```
+
+从而避免：
+
+```text
+无意义 builder 执行
+
+无意义 message construction
+```
+
+但：
+
+> **Enabled() 不是生命周期 correctness 的最终线性化边界。**
+
+原因是：
+
+```text
+Enabled() sees Running
+        ↓
+另一个线程 Shutdown wins
+        ↓
+当前线程继续向 Log()/admission 前进
+```
+
+这是合法并发。
+
+因此真正保证：
+
+```text
+Shutdown 后不接受新记录
+```
+
+的边界必须在：
+
+```text
+LoggingContext admission
+```
+
+内部。
+
+正式原则：
+
+> **Enabled 是 advisory；Admission 是 authoritative。**
+
+---
+
+## 1.10 热路径原则
+
+Runtime-disabled logging：
+
+```text
+message builder 不执行
 
 不访问 Backend
 
-不执行 Sink I/O
+不执行 output I/O
 
 不获取 ordinary mutex
+```
+
+Compile-time disabled logging进一步要求：
+
+```text
+logger expression 不执行
+
+message expression 不执行
 ```
 
 Async enabled logging：
@@ -570,40 +691,34 @@ Async enabled logging：
 ```text
 允许 caller-side message construction
 
-允许 caller-side message allocation
+允许 caller-side string allocation
 
 允许 queue synchronization
 
-不执行 Backend Sink I/O
+不执行 Backend output I/O
 ```
 
-这一点必须明确：
-
-> **Async enabled path 不承诺 caller-side zero allocation。**
-
-因为：
+因此 V1 明确不承诺：
 
 ```text
-message construction
-std::string materialization
+enabled async log
+= zero allocation
 ```
 
-本身可能需要 allocation。
+RoComm 的目标是：
 
-RoComm V1 的性能承诺是：
-
-> **不把 output I/O 放在异步日志调用线程，而不是宣称所有日志路径都 zero-allocation。**
+> **把 output I/O 移出通信调用线程，而不是伪造一个所有普通日志路径均 zero-allocation 的实时契约。**
 
 ---
 
-## 1.10 Sync 模式的明确代价
+## 1.11 Sync 模式的明确代价
 
-Synchronous 模式：
+Synchronous mode：
 
 ```text
 caller thread
     ↓
-LoggingContext serialization
+LoggingContext Backend serialization
     ↓
 Backend::Write()
     ↓
@@ -618,38 +733,88 @@ filesystem delay
 terminal delay
 ```
 
-会直接传播到调用点。
+都会传播到调用点。
 
-这是 Sync 模式的明确定义，不属于 Logging bug。
+而且：
 
-因此：
+> **一个慢 Backend/Sink 不只阻塞当前 Sync Logger，也会通过 Backend invocation serialization 阻塞其他并发 Sync Logger。**
 
-> **Sync mode 不是通信 hot-path optimization mode。**
+因此 Sync mode 不是 communication hot-path optimization mode。
 
-需要低干扰路径时应使用：
+如果关注调用线程延迟，应使用：
 
 ```text
 Asynchronous
+
 +
-非 Block overflow policy
+
+DropNewest / DropOldest
 ```
+
+而不是 `Block` 或 Sync I/O。
 
 ---
 
-## 1.11 参考项目与设计取舍
+## 1.12 不宣称 hard-real-time safe
 
-RoComm Logging 不复刻某一个日志库，而是分别借鉴高质量 C++ 项目的不同设计点。
+V1 Logging 可能：
+
+```text
+构造 std::string
+
+heap allocation
+
+queue mutex
+
+condition_variable
+
+atomic reference count
+
+Block waiting
+
+Sync Backend I/O
+```
+
+所以：
+
+> **RoComm Logging V1 不是 hard-real-time-safe API。**
+
+严格实时线程应该：
+
+```text
+关闭对应 category
+```
+
+或者：
+
+```text
+compile-time strip
+```
+
+未来如果需要严格 RT 事件记录，应新增：
+
+```text
+fixed-size RT event / trace primitive
+```
+
+而不是把普通 Logger 演化成复杂 realtime tracing framework。
+
+---
+
+## 1.13 参考项目与采用边界
+
+RoComm Logging 不复刻单一日志库，而是分别借鉴高质量 C++ 项目的不同设计点。
 
 | 参考项目 | RoComm 主要借鉴 |
 |---|---|
-| Abseil Logging | 窄前端、窄消费接口、Raw logging、recursion 处理 |
+| Abseil Logging | 窄前端、窄消费边界、Raw logging、递归防护 |
 | Boost.Log | 全局 filtering 与 output-specific filtering 分层 |
-| spdlog | 成熟 console/file/rotation 输出实现 |
+| spdlog | 成熟 console/file/rotation output |
 | Folly XLOG | disabled hot path、lazy evaluation、compile-time filtering |
 | brpc | 项目级 logging abstraction 与二次 filtering |
 | Qt `QLoggingCategory` | runtime category level 调整 |
-| Quill | frontend/backend 分离、未来 low-latency 优化方向 |
-| ClickHouse | Backend 内部多 output routing 思路 |
+| Quill | frontend/backend 分离、未来 low-latency 路线 |
+| ClickHouse | Backend 内部 multi-output routing 思路 |
 
 明确不照搬：
 
@@ -659,7 +824,9 @@ Abseil process-global logger registry
 Boost.Log 大型 attributes/filter subsystem
 
 spdlog global registry
+
 spdlog global shutdown
+
 spdlog async runtime
 
 Quill V1 deferred argument encoding
@@ -669,9 +836,9 @@ Qt arbitrary CategoryFilter callback
 ClickHouse route/channel subsystem
 ```
 
-RoComm 的目标始终保持：
+最终原则：
 
-> **窄 API、明确生命周期、低依赖、Runtime-local、可替换 Backend。**
+> **窄 API、低依赖、Runtime-local、明确生命周期、Backend 可替换。**
 
 ---
 
@@ -686,35 +853,37 @@ namespace rocomm::logging {
 }
 ```
 
-Backend-specific factory：
+spdlog Backend factory：
 
 ```cpp
 namespace rocomm::logging::spdlog {
 }
 ```
 
-未来：
+未来 NativeBackend：
 
 ```cpp
 namespace rocomm::logging::native {
 }
 ```
 
-Logging 内部不使用：
+禁止：
 
 ```text
 rocomm::logging::detail
+
 rocomm::logging::internal
+
 rocomm::logging::impl
 ```
 
-private 源码已经通过：
+private 实现由：
 
 ```text
 src/logging/
 ```
 
-形成物理边界。
+本身形成边界。
 
 ---
 
@@ -732,7 +901,7 @@ enum class LogLevel : std::uint8_t {
 };
 ```
 
-severity 顺序：
+severity：
 
 ```text
 Trace
@@ -750,7 +919,7 @@ Critical
 Off
 ```
 
-例如 effective level：
+如果 effective level：
 
 ```text
 Warn
@@ -768,7 +937,7 @@ Error    enabled
 Critical enabled
 ```
 
-`Off` 只用于：
+`Off` 只作为：
 
 ```text
 threshold
@@ -776,7 +945,7 @@ configuration
 compile-time filtering
 ```
 
-不允许创建：
+不得构造：
 
 ```text
 LogRecord(level = Off)
@@ -792,16 +961,16 @@ V1 不定义：
 Fatal
 ```
 
-为普通 LogLevel。
+普通 LogLevel。
 
 因为：
 
-> **日志严重程度和进程控制是两个不同概念。**
+> **Logging severity 与 process control 是两个概念。**
 
 `Critical`：
 
 ```text
-最高普通 severity
+只表示最高普通日志严重级别
 ```
 
 不会自动：
@@ -812,27 +981,13 @@ exit
 terminate
 ```
 
-真正 fail-fast 路径：
-
-```text
-best-effort Critical log
-        或
-      RawLog
-        ↓
-std::terminate()
-```
-
-由调用点显式执行。
+真正 fail-fast 由调用路径显式控制：仅可选尝试已证明 nonblocking 的 emergency diagnostic，然后 `std::terminate()`。不得先等待普通 Critical Log 或可能阻塞的 RawLog，具体边界见 §5.12。
 
 ---
 
 ## 2.4 SourceLocation
 
-C++17 不使用：
-
-```cpp
-std::source_location
-```
+RoComm 使用 C++17，不依赖 `std::source_location`。
 
 V1：
 
@@ -882,31 +1037,52 @@ private:
 };
 ```
 
-统一宏：
+标准宏：
 
 ```cpp
 #define ROCOMM_SOURCE_LOCATION \
     ::rocomm::logging::SourceLocation::FromStatic( \
         __FILE__, \
         __func__, \
-        __LINE__)
+        static_cast<std::uint32_t>(__LINE__))
 ```
 
-`FromStatic()` 表达的契约是：
-
-> `file` 和 `function` 必须具有至少覆盖该 LogRecord 生命周期的稳定存储。
-
-框架宏提供的编译器字符串满足这一要求。
+显式 cast 避免启用 `-Wconversion` 时产生无意义窄化告警。
 
 ---
 
-## 2.5 LogRecord
+## 2.5 SourceLocation lifetime
+
+`FromStatic()` 表达：
+
+> `file` 与 `function` 必须具有覆盖 LogRecord 生命周期的稳定存储。
+
+框架宏中的：
+
+```text
+__FILE__
+__func__
+```
+
+满足该约束。
+
+Application 不应把临时字符串的：
+
+```text
+c_str()
+```
+
+传给 `FromStatic()`。
+
+---
+
+## 2.6 LogRecord
 
 LogRecord 表示：
 
-> **message 已构造完成、caller metadata 已捕获，但尚未完成 output rendering 的逻辑日志记录。**
+> **message 已完成 materialization、caller metadata 已捕获，但尚未完成 Backend output rendering 的逻辑日志记录。**
 
-概念 Public API：
+Public read-only model：
 
 ```cpp
 class LogRecord {
@@ -947,15 +1123,21 @@ public:
     thread_id() const noexcept;
 
 private:
-    // constructed only by logging runtime
+    // Only logging runtime may construct a normal LogRecord.
 };
 ```
 
-用户不能直接构造一个正常 LogRecord。
+LogRecord 是：
+
+```text
+move-only
+```
+
+对象。
 
 ---
 
-## 2.6 LogRecord message ownership
+## 2.7 LogRecord message ownership
 
 LogRecord 必须独立拥有：
 
@@ -971,7 +1153,7 @@ logger.Log(
     temporary_string);
 ```
 
-返回以后：
+返回后：
 
 ```text
 temporary_string
@@ -979,63 +1161,77 @@ temporary_string
 
 可以立即销毁。
 
-Async queue 和 Backend 不依赖原 caller 字符串。
+Async queue 与 Backend 不依赖 caller-owned message。
 
 ---
 
-## 2.7 Category storage lifetime
+## 2.8 Category storage lifetime
 
-Category 不要求每条 LogRecord 单独复制：
+Category 不要求每个 LogRecord 重复复制：
 
 ```text
 "rocomm.fastdds.discovery"
 ```
 
-LoggingContext 可以 intern category 并建立：
+LoggingContext 可以建立：
 
 ```text
-CategoryEntry
+interned CategoryEntry
 ```
 
-LogRecord 保存：
+LogRecord 保存稳定 reference/handle。
+
+Category backing 由：
 
 ```text
-stable CategoryEntry reference/handle
+self-owned LoggingState
 ```
 
-关键生命周期契约：
+持有。
 
-> **Interned category storage 由 self-owned Logging State 持有。**
-
-其生命周期必须至少覆盖：
+其生命周期必须覆盖：
 
 ```text
-所有 queued LogRecord
+queued LogRecord
 
-所有正在 Backend::Write() 中的 LogRecord
+in-flight Backend::Write()
 
-所有 shutdown timeout 后仍 in-flight 的 LogRecord
+shutdown timeout 后仍在执行的 Backend::Write()
 ```
 
-因此即使：
+即使已经发生：
 
 ```text
 LoggingContext wrapper 已销毁
-+
-shutdown 已 Timeout
+
+所有 Logger 已销毁
+
+writer/control execution 仍未完成
 ```
 
-只要 Backend 仍处理某 LogRecord：
+只要 in-flight LogRecord 还存在：
 
-```text
+```cpp
 record.category()
 ```
 
-仍然有效。
+仍必须有效。
+
+因此 worker/control state 必须安全保持：
+
+```text
+LoggingState
+```
+
+而 LoggingState 持有：
+
+```text
+CategoryEntry registry
+```
 
 ---
 
-## 2.8 Backend 对 LogRecord 只有 borrowed access
+## 2.9 Backend 对 LogRecord 是 borrowed access
 
 ```cpp
 virtual void
@@ -1052,24 +1248,20 @@ record.message().data()
 
 record.category().data()
 
-SourceLocation 中的 pointer
+SourceLocation 中的 borrowed pointer
 ```
 
-如果 Custom Backend 需要延迟保存：
+Custom Backend 如果需要延迟处理：
 
-> **Backend 必须自行复制所需字段。**
+> **必须自己 materialize/copy 所需字段。**
 
-LoggingBackend SPI 本身是：
-
-```text
-synchronous consumer contract
-```
+LoggingBackend SPI 本身是 synchronous consumer contract。
 
 ---
 
-## 2.9 两级格式化模型
+## 2.10 两级格式化模型
 
-V1 明确区分：
+V1 严格区分：
 
 ```text
 Message Construction
@@ -1083,12 +1275,13 @@ Record Rendering
 
 ---
 
-### 2.9.1 Message Construction
+### 2.10.1 Message Construction
 
 发生在：
 
 ```text
 Logger frontend
+
 caller thread
 ```
 
@@ -1104,7 +1297,7 @@ caller thread
 LogRecord::message()
 ```
 
-这一步允许：
+这一阶段允许：
 
 ```text
 std::string allocation
@@ -1112,7 +1305,7 @@ std::string allocation
 
 ---
 
-### 2.9.2 Record Rendering
+### 2.10.2 Record Rendering
 
 发生在：
 
@@ -1124,44 +1317,51 @@ Backend dispatch side
 
 ```text
 timestamp
+
 level
+
 category
-thread_id
+
+caller thread ID
+
 source
+
 message
 ```
 
 渲染成：
 
 ```text
-2026-10-26T14:35:20.123456+09:00 [INFO] [rocomm.fastdds.discovery] [tid=18342] Participant matched [discovery.cpp:217]
+2026-10-26T14:35:20.123456+08:00 [INFO] [rocomm.fastdds.discovery] [tid=18342] Participant matched [discovery.cpp:217]
 ```
 
 ---
 
-## 2.10 为什么采用两级格式化
+## 2.11 两级格式化的意义
 
-这样可以同时满足：
+这种设计同时满足：
 
 ```text
-Public header 无 fmt/spdlog 依赖
+Public Core header 无 fmt/spdlog dependency
 
-caller metadata 真实
+caller timestamp 正确
 
-Async 模式不让 Backend 重新生成错误 thread ID
+caller thread ID 正确
 
-Backend 可以自行决定最终文本样式
+Async worker 不覆盖 caller metadata
+
+Backend 可以决定最终 output representation
 ```
 
 ---
 
-## 2.11 Logger
+## 2.12 Logger
 
 Logger 是：
 
 > **轻量、copyable、Runtime-bound handle。**
 
-概念：
+Public API：
 
 ```cpp
 class Logger {
@@ -1189,21 +1389,15 @@ public:
 
 ---
 
-## 2.12 默认构造 Logger
-
-正式冻结：
+## 2.13 默认 Logger
 
 ```cpp
 Logger logger;
 ```
 
-得到：
+得到 disabled Logger。
 
-```text
-disabled Logger
-```
-
-其行为：
+行为：
 
 ```text
 logger.Enabled(...)
@@ -1214,67 +1408,68 @@ logger.Log(...)
 
 logger.LogLazy(...)
 → builder 不执行
+
+logger.category()
+→ empty string_view
 ```
-
-这与：
-
-```text
-LoggingContext 已 Stopped 后的已有 Logger
-```
-
-行为一致。
 
 ---
 
-## 2.13 Logger copy / move 性能
+## 2.14 Logger copy / move
 
-Logger copy：
+正式性能契约：
 
 ```text
+copy:
 O(1)
+no heap allocation
 
+move:
+O(1)
 no heap allocation
 ```
 
-Logger move：
-
-```text
-O(1)
-
-no heap allocation
-```
-
-实现可以选择：
+内部允许：
 
 ```text
 std::shared_ptr
 
 intrusive refcount
 
-specialized state handle
+stable state handle
+
+其他等价机制
 ```
 
-但具体机制不是 V1 semantic contract。
+但具体引用机制：
 
-因此：
+```text
+不是 V1 API contract
+```
 
-> **V1 不冻结 `std::shared_ptr`。**
+V1 明确接受：
 
-如果 profiling 证明 shared_ptr atomic refcount 成本明显，可以替换内部 representation。
+```text
+Logger::Enabled()
+```
+
+执行 lifecycle 和 effective-level 两次 O(1) scalar atomic read。
+
+不为了减少一次 atomic read引入额外复杂度。
 
 ---
 
-## 2.14 Logger lifetime
+## 2.15 Logger lifetime
 
-Logger 内部必须安全保持所需 Logging State 生命周期。
+Logger 必须安全保持其所需 Logging State。
 
 LoggingContext wrapper 销毁后：
 
 ```text
-Logger memory-safe
+Logger 仍 memory-safe
 ```
 
-但 Logging State 已进入：
+但对应 Logging State 已：
 
 ```text
 Stopping / Stopped
@@ -1283,128 +1478,128 @@ Stopping / Stopped
 因此：
 
 ```text
-Logger::Enabled()
+Enabled()
 → false
 
-Logger::Log()
-→ safe no-op
+Log()
+→ safe no-op 或 lifecycle admission reject
 ```
 
-Logger 引用不能让 Logging pipeline 永远保持 Running。
+对于已经完成 Stop 且调用 `Log()` 的情况：
+
+```text
+最终不会进入 Backend
+```
+
+Logger 不允许让 worker 因 wrapper 消失而永久保持 Running。
 
 ---
 
-## 2.15 Logger::Enabled()
+## 2.16 Logger::Enabled()
 
-必须：
+`Logger::Enabled()` 是面向调用方和 LogLazy 的 advisory fast-path predicate。
 
-```text
-noexcept
+必须满足 `noexcept`、O(1)、zero heap allocation、no Backend I/O、no ordinary mutex。
 
-O(1)
-
-zero heap allocation
-
-no Backend I/O
-
-no ordinary mutex
-```
-
-逻辑至少等价于：
+逻辑等价于：
 
 ```cpp
-if (!state_) {
+if (!state_ || !state_->logging_enabled()) {
     return false;
 }
-
 if (state_->lifecycle() != Running) {
     return false;
 }
-
-return IsEnabled(
-    level,
-    entry_->effective_level());
+return IsEnabled(level, entry_->effective_level());
 ```
 
-因此通常包含：
+`logging_enabled()` 是 Create 时固定的配置，不会由动态 level API 改变；它可以用等价的 disabled handle representation 表达。通常需要 lifecycle 与 effective-level 两次 scalar atomic read；不可变 enabled 配置不增加 mutable atomic state。
 
-```text
-lifecycle/admission atomic load
-
-+
-
-effective-level atomic load
-```
+`Off` 不是合法 record severity，`Enabled(Off)` 返回 false。
 
 ---
 
-## 2.16 Enabled() 的原子表示
+## 2.17 Enabled() 不是 Admission
 
-V1 不要求直接使用：
+`Enabled()` 只表示：
+
+> **在该读取瞬间，这条日志值得继续构造。**
+
+它不保证：
+
+```text
+稍后一定能够 admission
+```
+
+因为：
+
+```text
+Thread A:
+Enabled() → true
+
+Thread B:
+Running → Stopping
+
+Thread A:
+继续构造 message
+继续调用 Log/admission
+```
+
+是合法并发。
+
+因此：
+
+> **Enabled() 不参与 Shutdown 的最终 correctness 线性化。**
+
+真正 lifecycle admission 决策必须发生在 LoggingContext admission boundary。
+
+---
+
+## 2.18 Enabled atomic representation
+
+V1 不要求内部直接写成：
 
 ```cpp
 std::atomic<LogLevel>
 ```
 
-推荐内部使用明确 scalar representation：
+推荐明确的 scalar representation：
 
 ```text
-uint8 / uint32
+std::uint8_t
+或
+std::uint32_t
 ```
 
-并在目标平台验证：
-
-```text
-lock-free atomic support
-```
+实现阶段必须验证目标平台相应 atomic。
 
 冻结的是：
 
 ```text
-scalar atomic read
+O(1)
+
+scalar atomic reads
 
 no ordinary mutex
-
-O(1)
 ```
 
-而不是具体 C++ storage type。
+不冻结：
+
+```text
+所有平台都必须 is_always_lock_free
+```
+
+某个平台如果 64-bit/某种标量 atomic 不是 lock-free：
+
+```text
+功能语义必须保持正确
+
+性能差异通过 benchmark 暴露
+```
 
 ---
 
-## 2.17 Shutdown 正确性不能只依赖 CategoryEntry=Off
-
-Shutdown 的真正 admission 线性化点是：
-
-```text
-Running
-   ↓ atomic transition
-Stopping
-```
-
-这一状态转换一旦成功：
-
-```text
-所有新的正常 log admission 都必须失败
-```
-
-之后可以把现有 CategoryEntry：
-
-```text
-effective_level → Off
-```
-
-作为优化，减少已持有 Logger 的后续检查成本。
-
-但：
-
-> **批量设置 CategoryEntry=Off 不是 Shutdown correctness mechanism。**
-
-因为 O(n) 更新本身存在时间窗口。
-
----
-
-## 2.18 Logger::Log()
+## 2.19 Logger::Log()
 
 ```cpp
 void Log(
@@ -1413,69 +1608,217 @@ void Log(
     SourceLocation source = {}) const noexcept;
 ```
 
-正常语义：
+正常顺序冻结为：
 
 ```text
-recursion check
+recursion check（默认 / config-disabled Logger 保持 no-op）
 ↓
-state / level check
+valid state / immutable logging-enabled check
 ↓
-caller timestamp
+validate record severity（Off / 非法值不提交 record）
 ↓
-caller thread ID
-↓
-message materialization
-↓
-LogRecord construction
+Running 时执行 effective-level check
+    // 非 Running 时交给 admission 拒绝
+    // 因 level 过滤返回前，再读 lifecycle；仍为 Running 才返回
 ↓
 LoggingContext admission
+    // 与 Running → Stopping 线性化
+    // 失败：rejected_after_stop++，return
+↓
+capture caller timestamp / caller thread ID
+↓
+materialize owned message
+↓
+construct LogRecord
+↓
+sync dispatch ownership / async queue ownership transfer
+    // 未转交前的任何失败或取消必须释放 admission ownership
 ```
 
-返回前 caller-owned message 已经完成 materialization。
+valid state check 只检查 Logger 是否持有有效 state handle；默认或 moved-from Logger 是 empty handle，安全 no-op。持有已停止 state 的 Logger 仍是有效 handle，不在这里因 lifecycle 提前返回。`enabled=false` 是独立的不可变 no-op gate，即使 state 已停止也不到 admission、不改变数据面 counters。
+
+`Log()` 不调用完整 `Enabled()` 作为 lifecycle gate。Running 时因 level 返回的操作，以最后一次观察 Running 的检查作为过滤决定；之后发生 Shutdown 不追溯计为 rejection。若观察到非 Running，必须继续到 authoritative admission。Shutdown 不修改 effective-level cache（§3.51）。
+
+非法 severity 不产生 LogRecord，也不到 admission；对有效且 enabled 的 Logger 计 `frontend_failures++`，不能把 `Off` 当作普通 severity 输出。
 
 ---
 
-## 2.19 Logger::LogLazy()
+## 2.20 为什么 direct Log() 仍检查 effective level
 
-目的：
-
-> **disabled logging 时 message expression 完全不执行。**
-
-正常路径：
+直接调用 `logger.Log(level, message)` 也不能绕过运行期 Category filtering。
 
 ```text
-recursion check
+Enabled():
+  immutable enabled gate + lifecycle/level advisory check
 
+Direct Log / LogLazy 的内部提交路径:
+  immutable enabled gate
+  + Running 时的 effective-level check
+  + authoritative admission lifecycle check
+```
+
+非 Running 时跳过 level filtering，由 admission 统一拒绝并计数；Running 时的过滤决定遵循 §2.19 的 lifecycle 复查规则。默认 / config-disabled Logger 始终是 no-op。
+
+过滤、admission ownership 与 `accepted` 是不同概念：获得 admission 后仍可能 materialization 失败、overflow 或取消，`accepted` 的转交计数点见 §3.68。
+
+---
+
+## 2.21 Admission boundary
+
+LoggingContext 内部必须存在语义等价于：
+
+```text
+TryBeginAdmission()
+```
+
+的机制。
+
+它不是 Public API。
+
+语义：
+
+```text
+if lifecycle == Running:
+    成功获得本次 log admission ownership
+
+if lifecycle == Stopping / Stopped:
+    reject
+```
+
+成功 admission 与：
+
+```text
+Running → Stopping
+```
+
+必须存在唯一线性化顺序。
+
+---
+
+## 2.22 Admission 与 Shutdown 线性化
+
+若 Log admission 先赢：
+
+```text
+Log:
+TryBeginAdmission()
+→ success
+
+Shutdown:
+Running → Stopping
+```
+
+则：
+
+> **Shutdown 必须把该 log 视为已经进入 Logging subsystem 的 operation。**
+
+它后续必须：
+
+```text
+成功 dispatch
+
+或
+按已冻结 overflow policy terminalize
+
+或
+在后续 frontend/materialization failure 中安全释放 admission ownership
+
+或
+Block producer 因 Shutdown 取消入队并 terminalize（§3.28）
+```
+
+不能出现：
+
+```text
+admission 成功
+但 Shutdown 不知道它存在
+```
+
+---
+
+若 Shutdown 先赢：
+
+```text
+Shutdown:
+Running → Stopping
+
+Log:
+TryBeginAdmission()
+→ reject
+```
+
+则：
+
+```text
+normal Backend 不再接收该记录
+```
+
+---
+
+## 2.23 Admission 内部实现不冻结
+
+允许使用：
+
+```text
+atomic lifecycle + in-flight admission count
+
+mutex-protected admission gate
+
+combined atomic state word
+
+其他可证明线性化的机制
+```
+
+不引入：
+
+```text
+Public AdmissionToken
+Public AdmissionLease
+```
+
+之类新 API。
+
+冻结的是：
+
+> **Admission 与 Running→Stopping 必须线性化。**
+
+---
+
+## 2.24 Logger::LogLazy()
+
+disabled logging 时 builder 不执行。正常路径：
+
+```text
+recursion check（默认 / config-disabled Logger 保持 no-op）
 ↓
-
 Enabled(level)
-
 ↓
-
-builder()
-
+builder()，最多一次；异常 / null const char* 按 frontend failure 处理
 ↓
-
-message materialization
-
+内部提交路径（与 direct Log 共用过滤与 admission 规则）
 ↓
-
-Log()
+admission success
+↓
+capture caller metadata
+↓
+move std::string result / copy borrowed result into owned message
+↓
+construct LogRecord
+↓
+sync dispatch / async queue ownership transfer
 ```
+
+`std::string` 返回值由 builder 在 admission 前构造；`std::string_view` / `const char*` 的 owned copy 在 admission 成功后执行。不得声称所有 builder allocation 都发生在 admission 后。
+
+内部提交路径必须接受 owned string 的移动，不能强制调用 public `Log(std::string_view)` 后再次复制。内部桥接声明可以放入 Logger 的 private 部分，installed header 不依赖 private source headers。
+
+Enabled 成功不保证 admission：若 builder 正常返回、后续提交观察到 Shutdown 并被 admission 拒绝，则 builder 已执行，`rejected_after_stop++`，record 不进入 Backend。若 builder 自身失败或记录在 Running 时被新的 category 配置过滤，则不到 admission，不增加该 rejection counter。
 
 ---
 
-## 2.20 LogLazy Builder contract
+## 2.25 LogLazy Builder contract
 
-V1 不使用模糊的：
-
-```text
-message-like type
-```
-
-正式限制为：
-
-Builder 返回下列之一：
+V1 Builder 只允许返回：
 
 ```text
 std::string
@@ -1485,121 +1828,219 @@ std::string_view
 const char*
 ```
 
-Header Finalization 可以通过 traits 给出清晰 static_assert。
+实际 trait 判断必须对返回类型执行 decay。
 
-不在 V1 支持：
-
-```text
-arbitrary streamable type
-fmt object
-custom formatter object
-```
-
----
-
-## 2.21 Log() 与 LogLazy() 的区别
-
-直接：
+概念：
 
 ```cpp
-logger.Log(
-    LogLevel::Debug,
-    BuildMessage());
+template <typename Builder>
+using LogLazyRawResult =
+    std::invoke_result_t<Builder&>;
+
+template <typename Builder>
+using LogLazyResult =
+    std::decay_t<
+        LogLazyRawResult<Builder>>;
 ```
 
-调用方会先执行：
-
-```text
-BuildMessage()
-```
-
-然后才能进入 `Log()`。
-
-所以：
-
-```text
-Log()
-```
-
-不能阻止 caller-side expression construction。
-
-而：
+因此字符串字面量：
 
 ```cpp
-ROCOMM_LOG_DEBUG(
+ROCOMM_LOG_INFO(
     logger,
-    BuildMessage());
+    "started");
 ```
 
-通过 `LogLazy()`：
+即使 lambda 原始返回类型：
 
 ```text
-Enabled == false
-→ BuildMessage() 不执行
+const char (&)[N]
 ```
 
-因此 hot-path 推荐：
+decay 后：
 
 ```text
-logging macro
-或
-LogLazy()
+const char*
 ```
 
-而不是直接 `Log(BuildMessage())`。
+因此合法。
 
 ---
 
-## 2.22 Recursion check 必须早于 Enabled()
+## 2.26 LogLazy compile-time diagnostic
 
-如果 Backend invocation guard 已经 active：
+Header 必须提供清晰 static assertion。
 
-```text
-Logger::Log()
-Logger::LogLazy()
-```
-
-不能先检查：
-
-```text
-Enabled()
-```
-
-因为 Backend Initialize/Shutdown 期间 LoggingContext 可能尚未处于普通 Running 状态。
-
-正式顺序：
-
-```text
-recursion guard
-    ↓
-normal Enabled check
-```
-
----
-
-## 2.23 Recursive Log()
-
-如果：
-
-```text
-BackendInvocationGuard active
-```
-
-且调用：
+语义等价于：
 
 ```cpp
-logger.Log(
-    level,
-    message,
-    source);
+static_assert(
+    std::is_same_v<Result, std::string> ||
+    std::is_same_v<Result, std::string_view> ||
+    std::is_same_v<Result, const char*>,
+    "LogLazy builder must return "
+    "std::string, std::string_view, or const char*.");
+```
+
+不要求输出复杂 template type name。
+
+---
+
+## 2.27 LogLazy materialization
+
+如果 Builder 返回：
+
+```text
+std::string
+```
+
+必须允许：
+
+```text
+move into owned LogRecord message
+```
+
+避免：
+
+```text
+string
+→ string_view
+→ 再次 copy
+```
+
+如果返回：
+
+```text
+std::string_view
 ```
 
 则：
 
 ```text
-不进入 LoggingContext
+copy into owned message
+```
 
-不检查普通 Enabled
+如果返回：
+
+```text
+const char*
+```
+
+则：
+
+```text
+copy into owned message
+```
+
+---
+
+## 2.28 Null `const char*`
+
+如果 LogLazy Builder 返回：
+
+```text
+nullptr
+```
+
+形式的 `const char*`：
+
+```text
+不得构造 invalid string_view
+不得产生 UB
+```
+
+处理为 frontend failure：
+
+```text
+frontend_failures++
+```
+
+如果 level：
+
+```text
+Error / Critical
+```
+
+则：
+
+```text
+RawLog minimal diagnostic
+```
+
+较低 level：
+
+```text
+safe drop
+```
+
+---
+
+## 2.29 Builder exception
+
+Builder 抛异常：
+
+```text
+不得逃出 Logger::LogLazy()
+```
+
+处理：
+
+```text
+frontend_failures++
+```
+
+如果：
+
+```text
+Error / Critical
+```
+
+则：
+
+```text
+RawLog minimal diagnostic
+```
+
+否则：
+
+```text
+safe drop
+```
+
+V1 不把 Builder exception 转成应用 communication Status。
+
+---
+
+## 2.30 Recursion check 必须先于 Enabled()
+
+对持有有效且 config-enabled state 的 Logger，Backend invocation guard active 时，必须先处理 recursion，再进行普通 `Enabled()` 检查。Backend Initialize/Flush/Shutdown 期间 state 可能非 Running，不能因此静默吞掉递归诊断。
+
+默认、moved-from 或 config-disabled Logger 始终 no-op；其 LogLazy builder 不执行，数据面 counters 不变。这一 immutable handle/config 检查不属于 lifecycle rejection。
+
+```text
+empty / config-disabled handle → no-op
+otherwise:
+  Backend recursion check
+  ↓
+  normal lifecycle / level / admission path
+```
+
+---
+
+## 2.31 Recursive `Log()`
+
+Backend invocation guard active 时：
+
+```cpp
+logger.Log(...)
+```
+
+行为：
+
+```text
+不进入 normal LoggingContext
+
+不做普通 Category filtering
 
 best-effort RawLog
 
@@ -1608,39 +2049,36 @@ recursive_fallbacks++
 
 ---
 
-## 2.24 Recursive LogLazy()
+## 2.32 Recursive `LogLazy()`
 
-如果 guard active：
-
-```text
-进入 emergency lazy path
-```
+Backend invocation guard active 时进入 emergency lazy path。
 
 该路径：
 
 ```text
-只执行 builder 一次
+builder 最多执行一次
 
-catch all
+catch everything
 
 bounded materialization
 
 RawLog
 ```
 
-同时设置：
+同时使用：
 
 ```text
-RawFallbackGuard
+thread_local RawFallbackGuard
 ```
 
-如果 builder 内再次触发 Logger：
+如果 Builder 自身再次调用 Logger：
 
 ```text
-直接 suppress nested recursive logging
+nested recursive logging
+→ suppress
 ```
 
-不得形成：
+防止：
 
 ```text
 Raw fallback
@@ -1650,11 +2088,49 @@ Raw fallback
 → ...
 ```
 
-无限递归。
+---
+
+## 2.33 BackendInvocationGuard 与 RawFallbackGuard 区分
+
+两者职责不同。
+
+`BackendInvocationGuard`：
+
+```text
+由 LoggingContext 在真正调用 Backend callback 的线程设置
+```
+
+用于检测：
+
+```text
+Backend → Logger
+```
+
+递归。
+
+`RawFallbackGuard`：
+
+```text
+只在 emergency fallback formatting/path 内设置
+```
+
+用于防止：
+
+```text
+Raw fallback 本身再次递归
+```
+
+普通 LogLazy Builder exception：
+
+```text
+不等价于 Backend recursion
+```
+
+不得错误设置或长期保留 BackendInvocationGuard。
 
 ---
 
-## 2.25 V1 不提供 fmt-style Core API
+## 2.34 V1 不提供 fmt-style Core API
 
 C++17 没有：
 
@@ -1662,14 +2138,14 @@ C++17 没有：
 std::format
 ```
 
-而公共头文件不能强制依赖：
+Public Core headers 也不能强制依赖：
 
 ```text
 fmt
 spdlog
 ```
 
-因此 V1 Core 不冻结：
+因此 V1 不冻结：
 
 ```cpp
 logger.Info(
@@ -1677,7 +2153,7 @@ logger.Info(
     name);
 ```
 
-这种 typed format API。
+这样的 typed format API。
 
 推荐：
 
@@ -1687,19 +2163,17 @@ ROCOMM_LOG_INFO(
     BuildMessage(name));
 ```
 
-未来可以单独新增：
+未来可以新增独立：
 
 ```text
 rocomm::logging::fmt
 ```
 
-adapter target。
-
-该 adapter 不属于 Logging Core dependency。
+adapter target，但不是 Core requirement。
 
 ---
 
-## 2.26 Logging macros
+## 2.35 Logging macros
 
 至少提供：
 
@@ -1731,17 +2205,18 @@ ROCOMM_LOG_CRITICAL
 
 ```text
 logger_expr
-→ 最多求值一次
+→ at most once
 
 message_expr
-→ 仅 Enabled 时求值
+→ 仅 runtime-enabled 时求值，
+   但 Enabled 后仍可能在 admission race 中输给 Shutdown
 ```
 
 ---
 
-## 2.27 Compile-time filtering
+## 2.36 Compile-time level
 
-预处理级别固定为：
+预处理常量：
 
 ```cpp
 #define ROCOMM_LOG_LEVEL_TRACE     0
@@ -1753,29 +2228,23 @@ message_expr
 #define ROCOMM_LOG_LEVEL_OFF       6
 ```
 
-必须与：
+顺序必须与：
 
 ```cpp
 LogLevel
 ```
 
-underlying ordering 保持一致。
+一致。
 
 ---
 
-## 2.28 `ROCOMM_LOGGING_COMPILED_LEVEL`
+## 2.37 `ROCOMM_LOGGING_COMPILED_LEVEL`
 
-```text
-ROCOMM_LOGGING_COMPILED_LEVEL
-```
-
-取值必须为：
+允许：
 
 ```text
 0..6
 ```
-
-或者上述对应 macro。
 
 默认：
 
@@ -1785,15 +2254,15 @@ ROCOMM_LOG_LEVEL_TRACE
 
 原因：
 
-> 默认 build 不应在编译期永久移除 Debug/Trace，从而仍允许运行时动态启用。
+> 默认构建不能永久删除 Debug/Trace，否则 Runtime category 动态配置失去意义。
 
-Release / deployment 可以显式配置更高 compiled level。
+Deployment build 可以主动提高 compiled level。
 
 ---
 
-## 2.29 Compile-time macro 语义
+## 2.38 Compile-time stripping
 
-例如：
+如果：
 
 ```text
 ROCOMM_LOGGING_COMPILED_LEVEL
@@ -1801,14 +2270,14 @@ ROCOMM_LOGGING_COMPILED_LEVEL
 ROCOMM_LOG_LEVEL_INFO
 ```
 
-则：
+那么：
 
 ```text
-TRACE macro
-DEBUG macro
+ROCOMM_LOG_TRACE
+ROCOMM_LOG_DEBUG
 ```
 
-必须完全编译为空操作。
+必须完全编译为 no-op。
 
 并且：
 
@@ -1824,11 +2293,11 @@ message_expr 不求值
 logger.Log(...)
 ```
 
-不属于 compile-time stripping contract。
+不受 compile-time macro stripping 约束。
 
 ---
 
-## 2.30 Category model
+## 2.39 Category model
 
 Category 使用：
 
@@ -1836,7 +2305,7 @@ Category 使用：
 dot-separated hierarchy
 ```
 
-正式官方 category 至少：
+官方 category 至少包括：
 
 ```text
 rocomm
@@ -1859,7 +2328,7 @@ rocomm.zenoh
 rocomm.grpc
 ```
 
-例如：
+扩展示例：
 
 ```text
 rocomm.fastdds.discovery
@@ -1873,40 +2342,28 @@ rocomm.service.server
 
 ---
 
-## 2.31 Category namespace
+## 2.40 Category namespace
+
+以下 namespace 保留：
 
 ```text
 rocomm
 rocomm.*
 ```
 
-保留给 RoComm 官方模块。
-
 Application 推荐：
 
 ```text
 app.*
-
 robot.*
-
 company.*
-```
-
-例如：
-
-```text
-robot.control
-
-robot.perception
-
-app.task
 ```
 
 ---
 
-## 2.32 Category grammar
+## 2.41 Category grammar
 
-Category 语法：
+Category：
 
 ```text
 segment(.segment)*
@@ -1937,22 +2394,15 @@ Category：
 
 > **case-sensitive。**
 
-官方 RoComm category 必须 lowercase。
+RoComm 官方 category 必须 lowercase。
 
-Application 也强烈推荐 lowercase，以避免：
-
-```text
-robot.Control
-robot.control
-```
-
-被误认为同一 category。
+Application 也强烈推荐 lowercase。
 
 ---
 
-## 2.33 GetLogger()
+## 2.42 GetLogger()
 
-正式冻结：
+正式 API：
 
 ```cpp
 Result<Logger>
@@ -1972,12 +2422,19 @@ GetLogger(
 invalid category
 → InvalidArgument
 
-category allocation failure
+category creation/allocation failure
 → ResourceExhausted
 
-LoggingContext stopping/stopped
+valid Context but lifecycle Stopping/Stopped
 → RuntimeStopped
+
+moved-from / invalid LoggingContext wrapper
+→ InvalidState
 ```
+
+---
+
+## 2.43 Logging disabled 下的 GetLogger
 
 如果：
 
@@ -1985,27 +2442,36 @@ LoggingContext stopping/stopped
 LoggingConfig.enabled == false
 ```
 
-但 Context 本身仍处于 Running：
+但 LoggingContext 仍是：
 
 ```text
-GetLogger()
-→ success
-
-Logger::Enabled()
-→ false
+Running
 ```
 
-这样 Core / Middleware 不需要因为关闭 Logging 改变初始化流程。
+则：
+
+```text
+GetLogger(valid category)
+→ success
+```
+
+返回 disabled Logger：
+
+```text
+Enabled() == false
+```
+
+这样 Core/Middleware 不需要因为关闭日志而改变初始化控制流。
 
 ---
 
-## 2.34 Hierarchical filtering
+## 2.44 Hierarchical filtering
 
 规则：
 
 > **longest matching dot-segment prefix wins。**
 
-配置：
+例如：
 
 ```text
 default:
@@ -2036,7 +2502,7 @@ rocomm.service
 
 ---
 
-## 2.35 普通字符串 prefix 不成立
+## 2.45 普通字符串 prefix 不属于 category inheritance
 
 以下：
 
@@ -2050,7 +2516,7 @@ rocomm.fastdds
 
 不得匹配。
 
-语义应等价于：
+解析应等价于：
 
 ```text
 rocomm.fastdds.discovery
@@ -2062,17 +2528,13 @@ rocomm
 default
 ```
 
-而不是：
-
-```text
-starts_with("rocomm.fast")
-```
+而不是任意 `starts_with()`。
 
 ---
 
-## 2.36 CategoryLevels
+## 2.46 CategoryLevels
 
-内部：
+private：
 
 ```cpp
 class CategoryLevels {
@@ -2092,47 +2554,31 @@ public:
 };
 ```
 
-文件：
+位于：
 
 ```text
 src/logging/category_levels.hpp
 ```
 
-namespace：
-
-```text
-rocomm::logging
-```
-
 ---
 
-## 2.37 CategoryLevels thread-safety
+## 2.47 CategoryLevels thread-safety
 
 正式冻结：
 
 > **CategoryLevels 自身不保证 thread-safe。**
 
-所有同步责任属于：
+同步责任统一属于：
 
 ```text
 LoggingContext
 ```
 
-因此：
-
-```text
-CategoryLevels
-```
-
-可以保持简单数据结构。
-
-禁止为了让内部辅助类“自己线程安全”而重复构造第二套 locking layer。
+不为了一个 private helper 再建立第二套内部 locking architecture。
 
 ---
 
-## 2.38 Dynamic category update
-
-LoggingContext 提供：
+## 2.48 Dynamic Category API
 
 ```cpp
 Status SetDefaultLevel(
@@ -2146,11 +2592,7 @@ Status ClearCategoryLevel(
     std::string_view category) noexcept;
 ```
 
----
-
-## 2.39 Dynamic update 错误语义
-
-非法 category：
+非法参数：
 
 ```text
 InvalidArgument
@@ -2162,186 +2604,190 @@ allocation failure：
 ResourceExhausted
 ```
 
-Context stopped：
+valid Context but stopped：
 
 ```text
 RuntimeStopped
 ```
 
----
+moved-from Context：
 
-## 2.40 Dynamic update strong semantic guarantee
-
-例如：
-
-```cpp
-SetCategoryLevel(
-    "rocomm.fastdds",
-    LogLevel::Debug);
+```text
+InvalidState
 ```
 
-必须满足：
+---
+
+## 2.49 `noexcept` 与 allocation
+
+这些 control API 虽然：
+
+```text
+noexcept
+```
+
+但内部可能因为：
+
+```text
+std::string
+map/hash insertion
+temporary state
+```
+
+产生 allocation。
+
+实现必须捕获：
+
+```text
+std::bad_alloc
+```
+
+并返回：
+
+```text
+ResourceExhausted
+```
+
+不得因为 `noexcept` 导致：
+
+```text
+std::terminate()
+```
+
+---
+
+## 2.50 Category update strong failure guarantee
+
+正式冻结：
 
 ```text
 成功
 → 新配置完整 commit
 
 失败
-→ 原 category configuration 保持不变
+→ 原配置保持不变
 ```
 
-实现应先准备：
+所有可能失败的步骤必须发生在 commit 之前。
+
+推荐流程：
 
 ```text
-new key/value
+validate
+↓
+完成必要 allocation
+↓
+准备新 configuration mutation
+↓
+完成所有可能失败的计算
+↓
+commit CategoryLevels
+↓
+以不会失败的 atomic store
+传播 effective-level cache
 ```
 
-成功以后再 commit。
-
-不能出现：
+一旦进入 cache propagation：
 
 ```text
-CategoryLevels 已改变
-但部分 CategoryEntry 未更新
-同时 API 返回 failure
-```
-
-的半更新状态。
-
----
-
-## 2.41 Dynamic update 复杂度
-
-V1 允许：
-
-```text
-O(number_of_existing_categories)
-```
-
-更新已有 Logger 的 effective level。
-
-这是：
-
-```text
-control-plane operation
-```
-
-不是 hot path。
-
-推荐维护：
-
-```text
-CategoryEntry registry
-```
-
-更新规则以后遍历已有 CategoryEntry。
-
-不为这一控制操作引入：
-
-```text
-复杂 prefix tree
-
-RCU
-
-generation propagation system
-```
-
-如果未来确实需要优化，可改成：
-
-```text
-generation + lazy recomputation
-```
-
-而不修改 Public API。
-
----
-
-## 2.42 两层 Filtering
-
-Filtering 分为：
-
-```text
-Layer 1:
-LoggingContext global category/level filtering
-
-Layer 2:
-Backend / output-specific filtering
-```
-
-Layer 1：
-
-```text
-发生在 message construction 之前
-```
-
-是真正 hot-path filter。
-
-Layer 2：
-
-```text
-发生在 LogRecord 已创建之后
-```
-
-用于：
-
-```text
-console Info+
-
-file Debug+
-```
-
-Backend：
-
-> **不得重新启用 LoggingContext 已丢弃的 record。**
-
----
-
-## 2.43 LoggingMode
-
-```cpp
-enum class LoggingMode :
-    std::uint8_t {
-    Synchronous,
-    Asynchronous,
-};
+不得再存在 failure path
 ```
 
 ---
 
-## 2.44 LogOverflowPolicy
+## 2.51 Category update 可见性
 
-```cpp
-enum class LogOverflowPolicy :
-    std::uint8_t {
-    DropNewest,
-    DropOldest,
-    Block,
-};
-```
-
-语义：
+强 failure guarantee 不等于：
 
 ```text
-DropNewest
-→ queue 满时丢当前新记录
-
-DropOldest
-→ queue 满时丢最旧 queued record，
-  当前新记录入队
-
-Block
-→ caller 等待 capacity
+所有 Logger 同一个 CPU 指令瞬间切换 level
 ```
+
+更新多个 CategoryEntry 时允许出现短暂：
+
+```text
+部分 Logger 已观察新值
+
+部分 Logger 仍观察旧值
+```
+
+最终必须：
+
+```text
+所有受影响 Logger 收敛到新值
+```
+
+V1 不承诺 global atomic cutover。
 
 ---
 
-## 2.45 LoggingConfig
+## 2.52 SetDefaultLevel / ClearCategoryLevel
 
-概念：
+`SetDefaultLevel()` 和 `ClearCategoryLevel()` 具有与 `SetCategoryLevel()` 相同的：
+
+```text
+failure strong guarantee
+
+bad_alloc → ResourceExhausted
+
+commit 后 propagation 不失败
+```
+
+语义。
+
+---
+
+## 2.53 Runtime 重复 SetCategoryLevel
+
+同一 category 重复设置：
+
+```text
+last-write-wins
+```
+
+例如：
+
+```text
+rocomm.fastdds = Info
+
+随后：
+
+rocomm.fastdds = Debug
+```
+
+最终：
+
+```text
+Debug
+```
+
+不执行 merge。
+
+---
+
+## 2.54 LoggingConfig
+
+Public API：
 
 ```cpp
 class LoggingConfig {
 public:
+    LoggingConfig() = default;
+
+    LoggingConfig(
+        const LoggingConfig&) = default;
+
+    LoggingConfig&
+    operator=(
+        const LoggingConfig&) = default;
+
+    LoggingConfig(
+        LoggingConfig&&) noexcept = default;
+
+    LoggingConfig&
+    operator=(
+        LoggingConfig&&) noexcept = default;
+
     LoggingConfig&
     SetEnabled(
         bool enabled) noexcept;
@@ -2379,53 +2825,321 @@ public:
 
 ---
 
-## 2.46 LoggingConfig setter 异常语义
+## 2.55 LoggingConfig::SetCategoryLevel 累积语义
 
-正式冻结：
-
-> **LoggingConfig 是普通 configuration builder。**
-
-涉及 allocation 的 setter：
+Configuration builder 的 Category override 语义正式冻结为：
 
 ```text
-SetCategoryLevel
+不同 category
+→ 累积
 
-SetBackendFactory
+同一 category 重复设置
+→ last-write-wins
 ```
 
-允许：
+例如：
+
+```cpp
+LoggingConfig config;
+
+config
+    .SetCategoryLevel(
+        "rocomm.fastdds",
+        LogLevel::Debug)
+    .SetCategoryLevel(
+        "rocomm.service",
+        LogLevel::Warn)
+    .SetCategoryLevel(
+        "rocomm.fastdds",
+        LogLevel::Trace);
+```
+
+最终配置等价于：
 
 ```text
-std::bad_alloc
+rocomm.fastdds
+→ Trace
+
+rocomm.service
+→ Warn
 ```
 
-等配置期 C++ exception。
-
-不把所有 config builder 改造成：
+即：
 
 ```text
-Result-returning setter
+不同 key 累积
+
+同 key 替换
 ```
 
-这与 RoComm `RuntimeConfig` / Options 的 builder 风格一致。
+不执行：
+
+```text
+merge
+multi-value
+first-write-wins
+```
 
 ---
 
-## 2.47 Queue capacity validation
+## 2.56 Config API 与 Runtime API 的同名语义一致
 
-`SetQueueCapacity()`：
+以下两个 API：
 
-```text
-只存储配置
+```cpp
+LoggingConfig::SetCategoryLevel(...)
+
+LoggingContext::SetCategoryLevel(...)
 ```
 
-真正 validation 在：
+对于同一 category 的重复操作都遵循：
+
+```text
+last-write-wins
+```
+
+差别仅在于：
+
+```text
+LoggingConfig
+→ 构建未来 Context 的静态配置
+
+LoggingContext
+→ 修改正在运行 Context 的 control-plane state
+```
+
+不能让两个同名 API 拥有不同重复设置语义。
+
+---
+
+## 2.57 LoggingConfig category 内部存储不冻结
+
+可以使用：
+
+```text
+std::vector<CategoryOverride>
+
+std::map<std::string, LogLevel>
+
+std::unordered_map<std::string, LogLevel>
+
+其他等价结构
+```
+
+只要保证：
+
+```text
+不同 category 累积
+
+同 category last-write-wins
+
+copy/move contract 成立
+```
+
+---
+
+## 2.58 LoggingConfig copy/move
+
+Copy 允许 allocation 与 `std::bad_alloc`，不标 noexcept。Move 是 V1 `noexcept` contract，实现必须选择支持该行为的数据布局。
+
+CI 同时验证公共声明：
+
+```cpp
+static_assert(std::is_nothrow_move_constructible_v<LoggingConfig>);
+static_assert(std::is_nothrow_move_assignable_v<LoggingConfig>);
+```
+
+以及内部实际 storage 的移动属性：在未强制声明外层 noexcept 的成员聚合 / storage 类型上检查相同 traits，或逐项验证实际被移动的成员。自定义 move body 还必须审查其所有执行步骤；这些步骤不得 allocation、调用可能抛异常的用户代码或执行其他可失败工作。
+
+显式 `noexcept = default` 会使外层 trait 为 true，即使成员 move 可能抛异常，因此仅检查 LoggingConfig 自身不能证明内部移动安全。新增成员时必须同步 storage 检查；优先调整 representation，不能静默移除公共 noexcept。
+
+---
+
+## 2.59 SetBackendFactory
+
+正式使用：
+
+```cpp
+LoggingConfig&
+SetBackendFactory(
+    LoggingBackendFactory factory);
+```
+
+即：
+
+```text
+by value + move
+```
+
+这样新 factory 在进入函数前已经成功构造。
+
+setter 内部再 move 到配置状态。
+
+应提供：
+
+> **strong exception guarantee。**
+
+如果新 factory construction/copy 在调用前失败：
+
+```text
+旧 factory 不变
+```
+
+---
+
+## 2.60 LoggingConfig builder exception model
+
+LoggingConfig 是：
+
+```text
+普通 configuration builder
+```
+
+涉及 allocation 的 builder：
+
+```text
+SetCategoryLevel
+SetBackendFactory
+```
+
+允许配置期 C++ exception。
+
+这与已经创建的 LoggingContext control API 不同：
+
+```text
+LoggingContext control API
+→ noexcept + Status
+```
+
+---
+
+## 2.61 Dynamic update 复杂度
+
+这是：
+
+```text
+control-plane operation
+```
+
+V1 允许：
+
+```text
+O(number_of_existing_categories)
+```
+
+遍历并更新 CategoryEntry。
+
+不为低频控制操作引入：
+
+```text
+复杂 prefix tree
+
+RCU
+
+generation propagation framework
+```
+
+未来可以用：
+
+```text
+generation + lazy recomputation
+```
+
+优化，而无需改变 API。
+
+---
+
+## 2.62 两层 Filtering
+
+过滤分成：
+
+```text
+Layer 1:
+LoggingContext global Category/Level filter
+
+Layer 2:
+Backend / output-specific filter
+```
+
+Layer 1：
+
+```text
+发生在 message builder 前
+```
+
+Layer 2：
+
+```text
+发生在 LogRecord 已创建以后
+```
+
+例如：
+
+```text
+Global:
+Debug+
+
+Console:
+Info+
+
+File:
+Debug+
+```
+
+Backend：
+
+> **不能重新启用 LoggingContext 已经过滤掉的记录。**
+
+---
+
+## 2.63 LoggingMode
+
+```cpp
+enum class LoggingMode : std::uint8_t {
+    Synchronous,
+    Asynchronous,
+};
+```
+
+---
+
+## 2.64 LogOverflowPolicy
+
+```cpp
+enum class LogOverflowPolicy : std::uint8_t {
+    DropNewest,
+    DropOldest,
+    Block,
+};
+```
+
+定义：
+
+```text
+DropNewest
+→ queue 满时丢弃当前新记录
+
+DropOldest
+→ queue 满时删除最旧 queued record，
+  当前新记录进入 queue
+
+Block
+→ caller 等待 capacity
+```
+
+---
+
+## 2.65 Queue capacity
+
+`SetQueueCapacity()` 只设置配置。
+
+真正 validation：
 
 ```text
 LoggingContext::Create()
 ```
 
-Async mode 下必须：
+Async mode 必须：
 
 ```text
 capacity >= 1
@@ -2437,13 +3151,40 @@ capacity >= 1
 InvalidArgument
 ```
 
-Sync mode 中 queue capacity 不参与运行，但仍建议进行统一合法性检查，避免一个 Config 在 mode 切换后变成潜在非法状态。
+V1 不设置任意固定最大值。
+
+如果用户设置：
+
+```text
+SIZE_MAX
+```
+
+或者其他无法分配的巨大值：
+
+```text
+size computation overflow
+或
+allocation failure
+```
+
+返回：
+
+```text
+ResourceExhausted
+```
+
+不把经验性的：
+
+```text
+8192
+65536
+```
+
+误写成公共上限。
 
 ---
 
-## 2.48 默认配置
-
-V1 推荐默认：
+## 2.66 默认配置
 
 ```text
 enabled:
@@ -2464,7 +3205,7 @@ DropNewest
 flush-on-level:
 Error
 
-category override:
+category overrides:
 none
 
 backend:
@@ -2473,29 +3214,26 @@ build default
 
 ---
 
-## 2.49 默认 Async 的理由
+## 2.67 默认 Async
 
-RoComm 第一定位是：
+RoComm 的主要定位是：
 
 ```text
 communication runtime
 ```
 
-默认不应让：
+所以默认不应让：
 
 ```text
 console I/O
-
 file I/O
-
 rotation
-
-Backend Flush
+flush
 ```
 
-阻塞通信线程。
+运行在通信调用线程。
 
-因此默认：
+默认：
 
 ```text
 Asynchronous
@@ -2503,7 +3241,7 @@ Asynchronous
 
 ---
 
-## 2.50 默认 DropNewest 的理由
+## 2.68 默认 DropNewest
 
 默认目标：
 
@@ -2512,28 +3250,24 @@ bounded memory
 
 +
 
-不阻塞通信线程
+不阻塞 communication producer
 ```
 
-因此不能默认：
+因此不默认：
 
 ```text
 Block
 ```
 
-选择：
+使用：
 
 ```text
 DropNewest
 ```
 
-会优先保存：
+保留已经进入 queue 的历史。
 
-```text
-已经进入 queue 的历史
-```
-
-需要优先看到最新日志的应用可以显式选择：
+需要最新日志优先的应用可以选择：
 
 ```text
 DropOldest
@@ -2541,7 +3275,7 @@ DropOldest
 
 ---
 
-## 2.51 Flush-on-level
+## 2.69 Flush-on-level
 
 如果：
 
@@ -2549,22 +3283,10 @@ DropOldest
 record.level >= flush_on_level
 ```
 
-Backend 在该 record 处理以后：
+正常 record output 后：
 
 ```text
-Flush
-```
-
-Async：
-
-```text
-writer/control side 执行
-```
-
-Sync：
-
-```text
-control path 按本文第 3 章的 timeout-safe 规则执行
+触发 Backend Flush
 ```
 
 `Off`：
@@ -2575,7 +3297,7 @@ control path 按本文第 3 章的 timeout-safe 规则执行
 
 ---
 
-## 2.52 默认 Error flush 的权衡
+## 2.70 默认 Error flush
 
 默认：
 
@@ -2586,31 +3308,31 @@ flush_on_level = Error
 偏向：
 
 ```text
-故障诊断
-crash 前尽快落盘
+crash diagnosability
+故障日志尽快落盘
 ```
 
 而不是 maximum throughput。
 
-如果应用可能高频产生 Error：
+高吞吐系统如果 Error 很频繁，应主动设置：
 
 ```text
 Critical
 ```
 
-或者：
+或：
 
 ```text
 Off
 ```
 
-可能更适合。
+README 应显式说明这一权衡。
 
 ---
 
-## 2.53 Text Backend 配置
+## 2.71 Text Backend configuration
 
-SpdlogBackend 和未来 NativeBackend 都需要：
+SpdlogBackend 和未来 NativeBackend 共享以下通用语义：
 
 ```text
 console
@@ -2619,27 +3341,25 @@ file
 
 rotation
 
-text formatting
+text rendering
 
-output-specific level
+output-specific severity
 ```
-
-这些是 Backend-neutral text logging semantics。
 
 因此 V1 定义：
 
 ```text
 TextFormatConfig
+
 TextBackendConfig
 ```
 
 ---
 
-## 2.54 TextFormatConfig
+## 2.72 TextFormatConfig
 
 ```cpp
-enum class LogTimeZone :
-    std::uint8_t {
+enum class LogTimeZone : std::uint8_t {
     Local,
     UTC,
 };
@@ -2663,21 +3383,17 @@ V1 不提供：
 custom pattern language
 ```
 
-避免重新实现一套复杂 pattern parser。
-
 ---
 
-## 2.55 ConsoleOutputConfig
+## 2.73 ConsoleOutputConfig
 
 ```cpp
-enum class ConsoleStream :
-    std::uint8_t {
+enum class ConsoleStream : std::uint8_t {
     Stdout,
     Stderr,
 };
 
-enum class ColorMode :
-    std::uint8_t {
+enum class ColorMode : std::uint8_t {
     Auto,
     Always,
     Never,
@@ -2697,7 +3413,7 @@ struct ConsoleOutputConfig {
 
 ---
 
-## 2.56 FileOutputConfig
+## 2.74 FileOutputConfig
 
 ```cpp
 struct FileOutputConfig {
@@ -2710,13 +3426,7 @@ struct FileOutputConfig {
 };
 ```
 
-非法：
-
-```text
-path empty
-```
-
-Backend factory：
+空 path：
 
 ```text
 InvalidArgument
@@ -2724,7 +3434,7 @@ InvalidArgument
 
 ---
 
-## 2.57 RotatingFileOutputConfig
+## 2.75 RotatingFileOutputConfig
 
 ```cpp
 struct RotatingFileOutputConfig {
@@ -2742,15 +3452,27 @@ struct RotatingFileOutputConfig {
 };
 ```
 
-`max_archived_files`：
+必须：
 
 ```text
-不包括 active file
+path 非空
+
+max_file_size_bytes > 0
+
+max_archived_files > 0
 ```
+
+否则：
+
+```text
+InvalidArgument
+```
+
+`max_archived_files` 不包括 active file。
 
 ---
 
-## 2.58 TextOutputConfig
+## 2.76 TextOutputConfig
 
 ```cpp
 using TextOutputConfig =
@@ -2762,7 +3484,7 @@ using TextOutputConfig =
 
 ---
 
-## 2.59 TextBackendConfig
+## 2.77 TextBackendConfig
 
 ```cpp
 struct TextBackendConfig {
@@ -2775,7 +3497,7 @@ struct TextBackendConfig {
 
 ---
 
-## 2.60 空 outputs 的语义
+## 2.78 Empty outputs
 
 正式冻结：
 
@@ -2784,41 +3506,70 @@ outputs.empty()
 → InvalidArgument
 ```
 
-不把它解释为：
+不能把空 outputs 偷偷解释成：
 
 ```text
-隐式 NullBackend
+NullBackend
 ```
 
-原因：
-
-```text
-空 outputs 更可能意味着用户配置遗漏
-```
-
-如果用户希望完全关闭 Logging：
+如果用户希望关闭 logging：
 
 ```cpp
 config.SetEnabled(false);
 ```
 
-如果未来需要显式 discard Backend：
+如果未来确实需要：
 
 ```text
-应定义明确 NullBackend
+discard all records
+but preserve pipeline
 ```
 
-而不是利用空 vector 隐式表达。
+应显式定义：
+
+```text
+NullBackend
+```
+
+V1 不做。
 
 ---
 
-# 3. LoggingContext、异步调度、并发与生命周期
+# 3. LoggingContext、Admission、异步调度、并发与生命周期
 
-## 3.1 LoggingContext
+## 3.1 Duration
 
-LoggingContext 是 Logging Runtime 的 owning facade。
+Logging 不定义新的 Duration 类型。
 
-概念：
+所有 timeout API 复用：
+
+```text
+RoComm Core 公共 Duration
+```
+
+即本文中的：
+
+```cpp
+rocomm::Duration
+```
+
+具体基础表示由 RoComm Core 统一定义。Logging timeout 统一使用单调时钟计算 elapsed/deadline；system_clock 只用于 LogRecord timestamp。
+
+负 timeout 返回 InvalidArgument，不发起 operation；零 timeout 仍允许建立请求/关闭 admission，但不等待尚未完成的工作，Pending 返回 Timeout，已完成返回保存结果。default/moved-from Shutdown 的无条件 Ok、disabled Context 的无 Backend control no-op 优先于 timeout validation。转换或 deadline 加法不得溢出，超大正 duration 使用饱和 deadline。
+
+Logging 不建立第二个：
+
+```text
+LoggingDuration
+```
+
+类型。
+
+---
+
+## 3.2 LoggingContext
+
+Public API：
 
 ```cpp
 class LoggingContext {
@@ -2831,11 +3582,11 @@ public:
         const LoggingContext&) = delete;
 
     LoggingContext(
-        LoggingContext&&) noexcept;
+        LoggingContext&& other) noexcept;
 
     LoggingContext&
     operator=(
-        LoggingContext&&) noexcept;
+        LoggingContext&& other) noexcept;
 
     static Result<LoggingContext>
     Create(
@@ -2856,10 +3607,10 @@ public:
         std::string_view category) noexcept;
 
     Status Flush(
-        Duration timeout) noexcept;
+        rocomm::Duration timeout) noexcept;
 
     Status Shutdown(
-        Duration timeout) noexcept;
+        rocomm::Duration timeout) noexcept;
 
     LoggingStats
     GetStats() const noexcept;
@@ -2868,13 +3619,15 @@ public:
 
 private:
     struct State;
-    std::shared_ptr<State> state_;
+    StateHandle state_;
 };
 ```
 
+`StateHandle` 为 private representation，不冻结具体实现。
+
 ---
 
-## 3.2 Lifecycle 与 quiescence 分离
+## 3.3 Lifecycle 与 quiescence
 
 Lifecycle：
 
@@ -2890,20 +3643,21 @@ Stopping
 Stopped
 ```
 
-另外独立存在：
+另外独立维护：
 
 ```text
-shutdown completion / quiescence
+shutdown completion
 ```
 
 因此允许：
 
 ```text
-logical state = Stopped
+lifecycle = Stopped
 
 但
 
-Backend cleanup 尚未完成
+Backend cleanup / blocked invocation
+仍未 quiescent
 ```
 
 这与 RoComm Runtime 的：
@@ -2911,66 +3665,153 @@ Backend cleanup 尚未完成
 ```text
 logical Stopped
 vs
-quiescent
+true quiescence
 ```
 
-模型保持一致。
+模型一致。
 
 ---
 
-## 3.3 Create 顺序
+## 3.4 Admission 是生命周期正确性的唯一正式边界
+
+`Logger::Enabled()` 可以观察：
+
+```text
+Running
+```
+
+然后在其返回之后 lifecycle 立即发生变化。
+
+因此最终决定：
+
+```text
+当前 Log 是否真正进入 Logging subsystem
+```
+
+的必须是 LoggingContext admission。
+
+语义等价于：
+
+```text
+TryBeginAdmission()
+```
+
+但不对 Public API 暴露。
+
+---
+
+## 3.5 Admission 成功的语义
+
+成功 admission 表示本次 logging operation 在线性化意义上先于 Shutdown admission cut，并已进入 shutdown responsibility。
+
+责任必须连续保持到以下任一情况：
+
+```text
+sync dispatch 接管（包括等待 Backend serialization 与完成 Write）
+async queue 接管（包括排队、in-flight Write 与 overflow terminalization）
+DropNewest terminalization
+frontend/materialization failure terminalization
+Block producer 因 Shutdown 取消入队并 terminalize
+```
+
+queue/dispatch 接管只是 ownership 转移，不是整条 record 已完成。Shutdown 必须继续追踪接管后的 queued/in-flight 工作直到终态。
+
+Admission ownership 不等于 `LoggingStats::accepted`；后者只在 §3.68 的成功转交点递增。
+
+---
+
+## 3.6 Admission 失败
+
+如果 lifecycle 已：
+
+```text
+Stopping
+Stopped
+```
+
+则 admission：
+
+```text
+reject
+```
+
+direct `Log()` 情况：
+
+```text
+rejected_after_stop++
+```
+
+不进入 normal Backend。
+
+---
+
+## 3.7 Admission ownership release
+
+admission 成功后的 message allocation、LogRecord construction、queue admission 失败，以及 Block 因 Shutdown 取消入队，都必须安全 terminalize，并释放 in-flight admission ownership。
+
+采用内部 RAII 或等价机制，保证每次成功 admission 恰好一次转交或终结；ownership 转交后由 queue/dispatch 的 completion tracking 负责最终完成，不能在两者之间出现 Shutdown 看不见的空窗。
+
+frontend / 意外 queue 转交 failure 计 `frontend_failures++`；DropNewest 计 `dropped_newest++`；Block 因 Shutdown 取消按 §3.28 处理。它们都不是 admission rejection。所有终态必须推进其对应的 Flush / Shutdown prefix completion，包括尚未产生 LogRecord 的 frontend failure。
+
+具体 lease/count/frontier representation 保持 private。
+
+---
+
+## 3.8 Create 顺序
 
 ```text
 validate LoggingConfig
-        ↓
-prepare category policy
-        ↓
-如果 enabled=false
-    跳过 Backend factory
-        ↓
-否则 invoke BackendFactory
-        ↓
-validate factory result
-        ↓
-Backend::Initialize()
-        ↓
-allocate bounded queue if Async
-        ↓
-prepare worker/control state
-        ↓
-start async writer if Async
-        ↓
+↓
+prepare CategoryLevels / immutable enabled gate
+↓
+if enabled=false:
+    不创建 Backend、queue、writer 或 Backend control runner
+else:
+    invoke BackendFactory / validate result
+    ↓
+    Backend::Initialize()
+    ↓
+    allocate bounded queue if Async
+    ↓
+    prepare shutdown completion + guaranteed cleanup execution resources
+    ↓
+    start writer / prepare required control execution
+↓
 publish Running
 ```
 
+成功 Create 直接返回 Running Context。发布 Running 前必须保证：后续 Shutdown initiation、析构和 move assignment 的旧 state release，不需要再 allocation 或创建线程即可发起并保持 cleanup progress。
+
+可以复用已经存在的 writer/control runner，或预备等价执行资源；具体布局不冻结。无法准备这些必要资源时 Create 返回 ResourceExhausted 或相应错误，并 rollback，不返回半初始化 Context。
+
 ---
 
-## 3.4 Create rollback
+## 3.9 Create rollback
 
 任何阶段失败都必须 rollback。
 
-例如 Backend 已初始化，但 queue allocation 失败：
+例如 Backend 已成功 Initialize，但 queue allocation 失败：
 
 ```text
-Backend::Shutdown()
+best-effort Backend::Shutdown()
 ↓
 destroy Backend
 ↓
-return failure
+return original failure
 ```
 
-writer 已经成功启动，但后续初始化失败：
+writer 已启动后出现后续失败：
 
 ```text
-signal worker stop
+request worker stop
 ↓
-join / complete worker shutdown
+complete safe worker cleanup
 ↓
 Backend::Shutdown()
 ↓
-destroy backing
+destroy state
 ↓
-return failure
+return original failure
 ```
 
 不得：
@@ -2983,9 +3824,52 @@ return failure
 
 ---
 
-## 3.5 BackendFactory
+## 3.10 Rollback failure
 
-公共：
+Rollback 自己也可能失败，例如：
+
+```text
+Backend::Shutdown()
+→ failure
+```
+
+规则：
+
+> **Create 最终仍返回导致 Create 失败的原始 Status。**
+
+Rollback failure：
+
+```text
+不得覆盖 primary failure
+```
+
+如果 normal Logging 尚不可用：
+
+```text
+RawLog best effort
+```
+
+报告 rollback secondary failure。
+
+---
+
+## 3.11 LoggingBackendFactory 所在 Header
+
+`LoggingBackendFactory` 正式定义于：
+
+```text
+include/rocomm/logging/logging_backend.hpp
+```
+
+因为它直接描述：
+
+```text
+LoggingBackend creation contract
+```
+
+而不是 LoggingConfig 专属类型。
+
+定义：
 
 ```cpp
 using LoggingBackendFactory =
@@ -2994,49 +3878,23 @@ using LoggingBackendFactory =
             std::unique_ptr<LoggingBackend>>()>;
 ```
 
-LoggingConfig 保存：
+---
+
+## 3.12 Factory failure Result
+
+Factory 返回失败：
 
 ```text
-factory
+原 Status 直接传播
 ```
 
-不是：
-
-```text
-shared Backend instance
-```
-
-从而每个 LoggingContext 都拥有：
-
-```text
-独立 Backend
-独立 state
-独立 lifecycle
-```
+LoggingContext 不二次重映射已经明确表达的 Backend creation failure。
 
 ---
 
-## 3.6 Factory failure Result
+## 3.13 Factory success + nullptr
 
-Factory：
-
-```cpp
-return Result<
-    std::unique_ptr<LoggingBackend>>{
-        error_status};
-```
-
-时：
-
-> **原 Status 直接传播。**
-
-LoggingContext 不重新映射一个已经明确表达失败原因的 Status。
-
----
-
-## 3.7 Factory success + nullptr
-
-以下是 Backend factory contract violation：
+以下是 contract violation：
 
 ```text
 Result success
@@ -3044,13 +3902,13 @@ Result success
 unique_ptr == nullptr
 ```
 
-LoggingContext：
+LoggingContext 返回：
 
 ```text
 InternalError
 ```
 
-Diagnostic 建议：
+Diagnostic：
 
 ```text
 Logging backend factory returned a null backend.
@@ -3058,9 +3916,9 @@ Logging backend factory returned a null backend.
 
 ---
 
-## 3.8 BackendFactory exception boundary
+## 3.14 BackendFactory exception boundary
 
-Factory callable 可以抛异常。
+Factory callable 可能抛异常。
 
 `LoggingContext::Create()` 必须捕获。
 
@@ -3075,23 +3933,19 @@ unknown exception
 → InternalError
 ```
 
-Diagnostic 可以保留：
+`std::exception::what()` 可进入 Diagnostic。
+
+Factory exception 不得穿过：
 
 ```text
-exception.what()
+LoggingContext::Create()
 ```
 
-但不得把 exception 穿越 LoggingContext::Create() 边界。
-
-Factory invocation 是：
-
-```text
-control-plane exception boundary
-```
+边界。
 
 ---
 
-## 3.9 Logging disabled 时不调用 factory
+## 3.15 Logging disabled
 
 如果：
 
@@ -3111,25 +3965,44 @@ AsyncQueue 不创建
 writer 不启动
 ```
 
-这样避免：
+但 Context 仍正常进入：
 
 ```text
-无意义 side effect
-无意义 file open
-无意义 third-party initialization
+Running
 ```
 
-所有 Logger：
+因此这是：
 
 ```text
-Enabled() == false
+一个真实 lifecycle Context
 ```
+
+而不是空 wrapper。
 
 ---
 
-## 3.10 Default Backend
+## 3.16 Disabled Context control behavior
 
-用户没有设置 BackendFactory 时：
+`enabled=false` 创建真实 Running Context，但不创建 Backend、AsyncQueue、writer 或 Backend control runner。
+
+```text
+GetLogger(valid category) → success disabled Logger
+Enabled(any level) → false
+Log / LogLazy → no-op，builder 不执行
+Flush → Ok
+Shutdown → Running → Stopping → Stopped，Ok
+GetStats → 数据面 counters 与 backend counters 全 0
+```
+
+SetDefaultLevel / SetCategoryLevel / ClearCategoryLevel 在 Running 时仍可验证、更新 category 配置并返回通常的 Status，但不能改变 immutable enabled gate、创建 Backend 或启用日志。停止后这些 API 返回 RuntimeStopped。
+
+disabled Logger 在 Shutdown 前后均不到 admission，也不执行 emergency builder 或增加 recursive/rejection counters；默认 / moved-from Logger 采用相同 no-op 原则。
+
+---
+
+## 3.17 Default Backend
+
+用户未提供 Factory 时：
 
 ```text
 使用 build default
@@ -3145,9 +4018,9 @@ ROCOMM_HAS_SPDLOG_BACKEND
 如果：
 
 ```text
-logging enabled
-+
-build 无默认 Backend
+enabled=true
+
+且 build 无 default Backend
 ```
 
 则：
@@ -3160,7 +4033,7 @@ UnsupportedConfiguration
 
 ---
 
-## 3.11 不暴露 BackendKind
+## 3.18 不暴露 BackendKind
 
 V1 不定义：
 
@@ -3175,22 +4048,194 @@ enum class BackendKind {
 原因：
 
 ```text
-不为未来 Feature 预埋枚举
+不提前为未来 Feature 预留枚举
 
-不让 Auto priority 变成稳定 API
+不让 Auto 优先级变成稳定 API
 
-BackendFactory 已足够表达显式选择
+BackendFactory 已能表达显式选择
 ```
 
 ---
 
-## 3.12 AsyncQueue
+## 3.19 LoggingContext move constructor
+
+Move constructor：
+
+```text
+转移 state handle
+```
+
+moved-from Context：
+
+```text
+becomes empty/invalid wrapper
+```
+
+不会触发原 state shutdown，因为 ownership 已被转移。
+
+---
+
+## 3.20 LoggingContext move assignment
+
+Move assignment 采用：
+
+> **release-before-acquire semantics。**
+
+如果 destination 原来持有一个 state：
+
+```text
+先对旧 state 发起 safe shutdown initiation
+↓
+释放 destination wrapper 对旧 state 的 ownership
+↓
+接收 source state
+↓
+source becomes moved-from
+```
+
+不得因为 move assignment：
+
+```text
+无界阻塞等待旧 Backend
+```
+
+旧 state 如果仍需要 cleanup：
+
+```text
+通过 self-owned state deferred cleanup
+```
+
+继续完成。
+
+---
+
+## 3.21 Moved-from LoggingContext
+
+moved-from wrapper 表示：
+
+```text
+invalid / empty wrapper
+```
+
+而不是 RuntimeStopped Context。
+
+正式行为：
+
+```text
+Shutdown(...)
+→ Ok
+  // safe idempotent release operation
+
+Flush(...)
+→ InvalidState
+
+GetLogger(...)
+→ InvalidState
+
+SetDefaultLevel(...)
+→ InvalidState
+
+SetCategoryLevel(...)
+→ InvalidState
+
+ClearCategoryLevel(...)
+→ InvalidState
+
+GetStats()
+→ zero snapshot
+```
+
+---
+
+## 3.22 为什么 moved-from 的不同 API 返回不同结果
+
+这些行为是有意设计，而不是不一致。
+
+### Shutdown
+
+`Shutdown()` 属于：
+
+```text
+resource release / cleanup operation
+```
+
+对 empty wrapper：
+
+```text
+安全幂等 no-op
+→ Ok
+```
+
+方便：
+
+```text
+scope cleanup
+error cleanup
+generic teardown
+```
+
+无需额外判断 wrapper 是否 moved-from。
+
+---
+
+### Flush / GetLogger / Set*Level
+
+这些属于：
+
+```text
+state-dependent control operation
+```
+
+需要有效 LoggingState。
+
+moved-from wrapper：
+
+```text
+没有 state
+```
+
+因此：
+
+```text
+InvalidState
+```
+
+---
+
+### GetStats
+
+`GetStats()` 属于：
+
+```text
+diagnostic query
+```
+
+为了让：
+
+```text
+监控
+错误处理
+析构诊断
+```
+
+代码可以无条件读取：
+
+```text
+moved-from
+→ zero snapshot
+```
+
+避免诊断路径再次引入 wrapper-validity 分支。
+
+---
+
+## 3.23 AsyncQueue
 
 Async mode 使用：
 
 > **bounded MPSC / single-consumer queue。**
 
-V1 推荐实现：
+V1 推荐首版实现：
 
 ```text
 preallocated ring buffer
@@ -3204,38 +4249,37 @@ mutex
 condition_variable
 ```
 
-不在 V1 一开始实现 lock-free queue。
+不提前实现 lock-free queue。
 
 原因：
 
 ```text
-语义清晰
+语义容易验证
 
 overflow 精确
 
-Block 容易正确实现
+Block 容易实现
 
-Shutdown race 易验证
+Shutdown race 容易审计
 
 TSAN 友好
 ```
 
 ---
 
-## 3.13 Queue allocation
+## 3.24 Queue allocation
 
-Async Context 初始化时预分配：
+Async Context 初始化时预分配固定：
 
 ```text
 capacity
 ```
 
-个 queue slot。
-
-Running 后：
+Running 后 queue container：
 
 ```text
-queue container 不增长
+不自动 grow
+
 不 resize
 ```
 
@@ -3245,17 +4289,17 @@ queue container 不增长
 queue storage bounded
 ```
 
-不保证：
+但不承诺：
 
 ```text
-Logger::Log zero allocation
+整个 Log operation zero allocation
 ```
 
 ---
 
-## 3.14 EnqueueResult
+## 3.25 EnqueueResult
 
-内部：
+private：
 
 ```cpp
 enum class EnqueueResult {
@@ -3266,37 +4310,36 @@ enum class EnqueueResult {
 };
 ```
 
-不暴露给 Application。
-
 用于：
 
 ```text
-stats
-overflow fallback
+overflow accounting
+
+RawLog fallback
+
 shutdown race
 ```
 
+不进入 Public API。
+
 ---
 
-## 3.15 DropNewest
+## 3.26 DropNewest
 
 queue full：
 
 ```text
-当前新 LogRecord
-→ 不入 queue
+当前新 LogRecord 不入 queue
 
-旧 queue
-→ 不变
+旧 queue 不变
 
 dropped_newest++
 ```
 
-如果新 record：
+如果当前新 record：
 
 ```text
-Error
-Critical
+Error / Critical
 ```
 
 则：
@@ -3305,7 +4348,7 @@ Critical
 RawLog minimal fallback
 ```
 
-但仍计为：
+但该 record 不计 accepted，仍然属于：
 
 ```text
 dropped_newest
@@ -3315,7 +4358,7 @@ dropped_newest
 
 ---
 
-## 3.16 DropOldest
+## 3.27 DropOldest
 
 queue full：
 
@@ -3324,14 +4367,13 @@ queue full：
 
 dropped_oldest++
 
-当前 LogRecord 入队
+当前 LogRecord 入 queue
 ```
 
-如果被删除的旧 record：
+如果被删除 record：
 
 ```text
-Error
-Critical
+Error / Critical
 ```
 
 则：
@@ -3340,122 +4382,100 @@ Critical
 RawLog minimal fallback
 ```
 
-但仍然必须删除它。
-
-禁止：
+但不得：
 
 ```text
-因为 severity 高
-改为寻找其他低 severity record 删除
+为了保护高 severity
+改删别的低 severity record
 ```
 
 原则：
 
-> **Overflow policy 不按照 severity 重写。Severity 只影响 emergency fallback。**
+> **Overflow policy 不根据 severity 改写；severity 只影响 emergency fallback。**
 
 ---
 
-## 3.17 Control event 不允许被 DropOldest 删除
+## 3.28 Block
 
-如果内部使用：
+queue full 时 producer 等待 capacity，直到 consumer pop 或 Shutdown 开始。Shutdown 必须唤醒所有 blocked producers。
 
-```text
-Flush barrier
-
-Shutdown control event
-```
-
-这些控制信息不得参与普通 LogRecord overflow。
-
-实现可以：
+admission 已成功、但尚未获得 queue ownership 的 producer，在观察到 Stopping/Stopped 后取消入队：
 
 ```text
-control path 独立于 queue capacity
+不调用 Backend
+不增加 accepted
+不增加 rejected_after_stop（admission 已成功）
+不增加 dropped_newest / dropped_oldest / frontend_failures
+内部 terminalize，并释放 admission ownership
+推进 Flush / Shutdown 对应 prefix completion
+Error/Critical → best-effort RawLog minimal fallback
 ```
 
-或者使用：
+这是一种明确的 shutdown cancellation，公共 V1 stats 不单独计数；它不改写任何 overflow policy。若 queue ownership 已在 shutdown cut 前成功转交，则该 record 属于正常 drain/overflow responsibility。
 
-```text
-不可丢弃 barrier representation
-```
+不得形成 Shutdown 等 producer、producer 等 queue、writer 已停止的死锁。
 
 ---
 
-## 3.18 Block
+## 3.29 Control signaling 不占普通 LogRecord capacity
 
-queue full：
+Flush / Shutdown control progress：
 
-```text
-producer 等待 capacity
-```
+> **不能因为普通 LogRecord queue 已满而无法建立。**
 
-直到：
+因此 control signaling：
 
 ```text
-consumer pop
+不消耗普通 LogRecord capacity
 
-或
+不受 DropNewest 影响
 
-Shutdown 开始
+不受 DropOldest 影响
 ```
 
-Shutdown 时：
+实现可以是：
 
 ```text
-notify all blocked producers
+独立 control state
+
+side channel
+
+sequence/frontier
+
+non-droppable internal representation
 ```
 
-producer 返回内部：
-
-```text
-Stopped
-```
-
-不能形成：
-
-```text
-Shutdown 等 producer
-
-producer 等 queue
-
-writer 已停止
-```
-
-的死锁。
+具体算法不冻结。
 
 ---
 
-## 3.19 Async writer
+## 3.30 Async writer
 
 每个 Async LoggingContext：
 
 ```text
-一个 writer thread
+一个 normal logging writer
 ```
 
-V1 不提供：
+V1 不提供多个 logging workers。
+
+这样可以：
 
 ```text
-multiple logging workers
-```
+保持 queue order
 
-原因：
+简化 Backend serialization
 
-```text
-保持 accepted order
+简化 Flush
 
-Backend 不需要并发 Write
-
-Flush 更简单
-
-Shutdown 更简单
+简化 Shutdown
 ```
 
 ---
 
-## 3.20 Backend invocation 串行化
+## 3.31 Backend invocation serialization
 
-LoggingContext 保证：
+同一 Backend：
 
 ```text
 Initialize
@@ -3464,77 +4484,74 @@ Flush
 Shutdown
 ```
 
-不会并发进入同一个 Backend。
+不能并发执行。
 
 Async：
 
 ```text
-writer/control path
+writer/control execution
 ```
 
-串行。
+负责 serialization。
 
 Sync：
 
 ```text
-caller thread
-↓
-backend invocation mutex
-↓
-Backend
+caller/control execution
++
+Backend invocation mutex
 ```
 
-串行。
+负责 serialization。
 
-因此：
+因此 Custom Backend：
 
-> **Custom Backend 不要求 Write 本身 thread-safe。**
+```text
+不要求 Write() thread-safe
+```
 
 ---
 
-## 3.21 Sync mode
+## 3.32 Sync normal Write
 
-正常：
+Synchronous mode：
 
 ```text
 Logger::Log
 ↓
 caller thread
 ↓
-backend invocation mutex
+Backend invocation serialization
 ↓
 Backend::Write
 ```
 
-因此 Sync mode 允许：
+Backend 慢：
 
 ```text
-mutex contention
-+
-Backend I/O delay
+当前 caller 被阻塞
 ```
 
-传播给调用点。
-
-V1 不提供：
+并且：
 
 ```text
-SingleThreadedSync
+其他并发 Sync caller
+也可能阻塞在 Backend serialization
 ```
 
-等特殊模式。
+这是正式语义。
 
 ---
 
-## 3.22 日志顺序
+## 3.33 日志顺序
 
-Async mode 的 Backend dispatch order：
+Async mode 的 Backend dispatch 顺序：
 
 ```text
 accepted queue linearization order
 ```
 
-同一个 producer：
+同一 producer：
 
 ```text
 A
@@ -3542,7 +4559,7 @@ B
 C
 ```
 
-正常保持：
+正常 dispatch：
 
 ```text
 A
@@ -3550,186 +4567,164 @@ B
 C
 ```
 
-除非某条记录明确被 overflow policy 丢弃。
+除非 record 明确被 overflow 丢弃。
 
-不同 producer：
+多 producer：
 
 ```text
 不保证 timestamp total order
 ```
 
-不做跨线程：
+不做跨线程 timestamp merge。
+
+---
+
+## 3.34 BackendInvocationGuard
+
+LoggingContext 在实际调用 Backend callback 的线程设置：
 
 ```text
-timestamp merge sort
+thread_local BackendInvocationGuard
+```
+
+保护：
+
+```text
+Initialize
+
+Write
+
+Flush
+
+Shutdown
+```
+
+Backend 内部再次调用 RoComm Logger：
+
+```text
+normal pipeline 不允许递归
+→ RawLog fallback
 ```
 
 ---
 
-## 3.23 BackendInvocationGuard
-
-Backend invocation boundary 必须建立：
-
-```text
-thread_local recursion guard
-```
-
-逻辑：
-
-```text
-LoggingContext
-↓
-BackendInvocationGuard
-↓
-Backend callback
-```
-
-guard 设置发生在：
-
-> **实际执行 Backend callback 的线程。**
+## 3.35 Guard thread ownership
 
 Async：
 
 ```text
-writer/control thread
+guard 设置在 writer/control execution thread
 ```
 
 Sync：
 
 ```text
-caller/control thread
+normal Write guard 设置在 caller thread
+
+Flush/Shutdown guard 设置在 control execution thread
+```
+
+绝不能只在：
+
+```text
+原 Logger caller thread
+```
+
+设置 guard。
+
+---
+
+## 3.36 Flush
+
+Public API：
+
+```cpp
+Status Flush(
+    rocomm::Duration timeout) noexcept;
+```
+
+Flush 使用：
+
+> **与 log admission 线性化的、不可丢弃的 prefix barrier。**
+
+---
+
+## 3.37 Flush barrier 语义
+
+Flush 为与 admission 线性化的不可丢弃 prefix barrier。
+
+boundary 前成功 admission 的 operation 必须先达到终态：
+
+```text
+Backend::Write 已返回
+或 DropNewest / DropOldest terminalized
+或 frontend/materialization failure terminalized
+或 Block 因 Shutdown 取消入队并 terminalized
+```
+
+这包括 boundary 前已获得 admission、但尚未完成 owned message / LogRecord 构造的 operation。Backend Write 返回即满足 dispatch completion；其 output error 由 BackendStats 表示，不追溯转成该 Flush 的逐记录错误。
+
+prefix 全部完成后执行 Backend::Flush；其返回 Status 是该运行期 Flush 的结果。Backend Flush 失败不能伪装为 Ok，也不撤销已经完成的 prefix。boundary 后的 operation 不属于本次等待要求。
+
+若 Flush 与 Shutdown 合并，则遵循 §3.42–§3.43 的共享 shutdown result。
+
+---
+
+## 3.38 Flush linearization point
+
+定义为：
+
+> **LoggingContext 在与 admission 相同的同步域中，成功建立该 Flush prefix boundary 的时刻。**
+
+因此：
+
+```text
+boundary 之前成功 admission
+→ 属于该 Flush guarantee，即使尚未计 accepted
+
+boundary 之后成功 admission
+→ 不要求该 Flush 等待
 ```
 
 ---
 
-## 3.24 Guard 覆盖全部 Backend callback
+## 3.39 Flush barrier algorithm 不冻结
 
-以下都必须受 guard 保护：
-
-```text
-Backend::Initialize
-
-Backend::Write
-
-Backend::Flush
-
-Backend::Shutdown
-```
-
-因此 Backend 在任意 lifecycle callback 内错误地使用 RoComm Logger：
+允许：
 
 ```text
-都会进入 RawLog fallback
+control barrier
+
+sequence + completion frontier
+
+completion bitmap
+
+其他语义等价实现
 ```
 
-而不是重新进入 normal pipeline。
+V1 不冻结某个具体内部算法。
 
----
-
-## 3.25 Flush 不是简单 accepted-counter 比较
-
-V1 不把 Flush correctness 定义为：
+尤其不能简单把：
 
 ```text
-读取 accepted counter
-然后等待 dispatched == accepted
+accepted == dispatched
 ```
 
-因为：
+当作 Flush correctness，因为：
 
 ```text
 DropOldest
 
 in-flight Write
 
-concurrent producers
+concurrent producer
 ```
 
-会让简单计数不足以表达 prefix completion。
+都会破坏这种简单推断。
 
 ---
 
-## 3.26 Flush barrier 语义
-
-```cpp
-Status Flush(
-    Duration timeout) noexcept;
-```
-
-Flush 必须建立：
-
-> **与 log admission 线性化的不可丢弃 barrier。**
-
-概念：
-
-```text
-Producer A:
-R1 ─ R2 ─────────────┐
-
-Producer B:
-────── R3 ───────────┼── [FLUSH BARRIER] ── later records
-                     │
-                     ▼
-                   writer
-```
-
-barrier 之前已经成功 admission 的记录必须最终成为：
-
-```text
-Backend 已 dispatch
-
-或者
-
-已按明确 overflow policy terminalize
-```
-
-之后：
-
-```text
-Backend::Flush()
-```
-
-完成，Flush 才返回：
-
-```text
-Ok
-```
-
----
-
-## 3.27 Flush 线性化点
-
-正式定义：
-
-> **LoggingContext 通过与 log admission 相同的同步域，成功发布 Flush barrier 的时刻。**
-
-因此：
-
-```text
-barrier 之前
-→ 属于本次 Flush
-
-barrier 之后
-→ 不要求本次 Flush 等待
-```
-
-具体实现可以采用：
-
-```text
-non-droppable control barrier
-
-或
-
-monotonic sequence + completion frontier
-
-或其他语义等价机制
-```
-
-不冻结内部算法。
-
----
-
-## 3.28 Flush barrier 不受 overflow 影响
+## 3.40 Flush barrier 不可丢弃
 
 任何：
 
@@ -3739,188 +4734,139 @@ DropOldest
 Block
 ```
 
-都不能：
-
-```text
-丢弃 Flush barrier
-```
-
-否则 Flush 将无法形成可靠 prefix barrier。
+都不能丢掉 Flush control progress。
 
 ---
 
-## 3.29 Flush timeout
+## 3.41 Flush timeout 覆盖范围
 
-如果 deadline 到达而 barrier 尚未完成：
+timeout 从：
+
+```text
+Flush() 调用开始
+```
+
+计算，并覆盖完整过程：
+
+```text
+建立 prefix boundary
+
+等待之前记录 terminalize
+
+等待 Backend invocation serialization
+
+执行 / 等待 Backend::Flush completion
+```
+
+如果任一阶段超过 deadline：
 
 ```text
 Flush()
 → Timeout
 ```
 
-此时调用方不能假设：
+调用方不得假设：
 
 ```text
-barrier 前全部记录已经 dispatch/flush
+prefix 已经完整 flush
 ```
 
-后台仍允许：
-
-```text
-继续推进该 Flush operation
-```
-
-但已经返回的：
-
-```text
-Timeout Status
-```
-
-不再被修改。
+后台 control operation 可以继续安全推进。
 
 ---
 
-## 3.30 Concurrent Flush
+## 3.42 Concurrent Flush
 
-多个线程同时 Flush：
+每个 Flush 有自己的 prefix guarantee 和从调用开始计算的 deadline；可以合并兼容的内部 control state，但不得削弱任意 caller 的 prefix。
 
-```text
-每个调用拥有自己的 barrier semantic
-```
+Shutdown cut 前已建立的 Flush 可以先完成，或被 shutdown prefix 吸收。被吸收时由 shutdown 的最终 Flush/Shutdown 完成它，并观察共享 final Status。尚未建立 boundary 就观察到非 Running 的调用直接 join shutdown completion。
 
-实现允许：
+所有 pending / timed-out control execution 都必须受同一 control ordering 管理：Backend::Shutdown 开始前完成其应执行的 Backend Flush，或将其合并/取消为 join shutdown；Backend::Shutdown 开始后不得再执行 Write/Flush/Initialize。
 
-```text
-合并兼容 barrier
-```
-
-但只有在不改变：
-
-```text
-各自 prefix guarantee
-```
-
-的情况下才能合并。
-
-不要求 V1 暴露 Flush ID。
+per-operation thread 不得仅靠取得 Backend mutex 就盲目执行旧请求；它必须核对 control state。shutdown completion Complete 还要求所有旧 control execution 已退出或安全解除执行责任。
 
 ---
 
-## 3.31 Flush during Stopping
+## 3.43 Flush during Stopping / Stopped
 
-如果：
-
-```text
-Shutdown 已开始
-```
-
-则新的 Flush 不再插入普通运行期 barrier。
-
-它应：
+有效 Context 已非 Running 时，新的 Flush 不建立运行期 barrier，而是 join 同一个 shutdown completion。
 
 ```text
-join 当前 shutdown completion
+在本次 deadline 内完成 → 返回保存的 shutdown final Status
+到 deadline 仍 Pending → Timeout
+已经 Complete → 立即返回保存的 final Status
 ```
 
-在 timeout 内如果 shutdown 达到：
-
-```text
-Backend Flush / Shutdown completion
-```
-
-返回：
-
-```text
-Ok
-```
-
-否则：
-
-```text
-Timeout
-```
+完成不等于成功：Backend Flush/Shutdown 的错误按 §3.56 传播。moved-from Context 返回 InvalidState；config-disabled Context 没有 Backend，返回 Ok。
 
 ---
 
-## 3.32 为什么 Backend::Flush() 不接收 timeout
+## 3.44 Backend timeout 不属于 Backend SPI
 
-Backend SPI：
+Backend：
 
 ```cpp
 Status Flush() noexcept;
+Status Shutdown() noexcept;
 ```
 
-自身不承担 deadline。
+不接受 timeout。
 
-timeout 属于：
+deadline 是：
 
 ```text
-LoggingContext control operation
+LoggingContext control-plane semantic
 ```
 
-这样：
-
-```text
-Custom Backend
-```
-
-无需实现第二套 timeout mechanism。
-
-LoggingContext 负责：
-
-```text
-在独立可延迟存活的执行上下文中调用 Backend control operation
-+
-等待 completion 到用户 deadline
-```
+这样 Custom Backend 不需要重新实现 timeout framework。
 
 ---
 
-## 3.33 Sync mode 的 Flush timeout
+## 3.45 Sync mode 下的 Flush/Shutdown timeout
 
-这是 V1 必须明确解决的语义。
+Synchronous mode 只意味着：
 
-Sync normal log：
+> **正常 `Backend::Write()` 在 Logger caller thread 执行。**
 
-```text
-caller thread
-→ Backend::Write
-```
-
-但：
-
-```text
-Flush(timeout)
-```
-
-不能直接在调用 `Flush()` 的 caller thread 上执行可能无限阻塞的：
+不意味着：
 
 ```text
 Backend::Flush()
+Backend::Shutdown()
 ```
 
-否则 timeout 无法兑现。
+必须直接运行在调用 `Flush()` / `Shutdown()` 的用户线程。
 
-因此正式冻结：
+否则 Backend 永久阻塞时：
 
-> **Sync mode 只规定正常 `Write()` 在 caller thread 执行；Flush/Shutdown 等带 timeout 的 control operation 可以在 self-owned control execution context 中执行。**
+```text
+timeout contract 无法兑现
+```
 
 ---
 
-## 3.34 Sync control execution
+## 3.46 Self-owned control execution
 
-Sync Flush：
+带 timeout 的 Backend control operation 必须通过：
+
+```text
+self-owned control execution state
+```
+
+执行。
+
+概念：
 
 ```text
 caller
   ↓
-publish Flush barrier / close prefix
+request control operation
   ↓
-self-owned control task/thread
+self-owned execution
   ↓
-acquire backend invocation serialization
+wait Backend serialization
   ↓
-Backend::Flush()
+Backend::Flush / Shutdown
   ↓
 completion
 ```
@@ -3928,53 +4874,45 @@ completion
 caller：
 
 ```text
-wait_until(deadline)
+只等待到 deadline
 ```
 
-超时：
-
-```text
-return Timeout
-```
-
-control operation 继续安全执行。
+control/admission synchronization 不得跨 Backend callback、RawLog I/O、builder 或其他用户代码持锁；overflow emergency 输出也必须移到这些锁外。所有可能等待的同步步骤纳入 deadline，不能用无期限获取普通 mutex 破坏 timeout。
 
 ---
 
-## 3.35 Sync control execution implementation
+## 3.47 Control execution 实现保持开放
 
-可以使用：
+允许 persistent worker、lazy worker、per-operation self-owned thread 或等价策略，但都必须满足 §3.8 的 shutdown 资源预备和 §3.42 的 control ordering。
 
-```text
-临时 self-owned control thread
+persistent worker 线程数稳定；lazy/per-operation execution 有创建成本。任何策略下，同一 Backend 的 Initialize/Write/Flush/Shutdown 都必须串行。
 
-共享 Logging control worker
+因此一个永久阻塞的 Backend callback 会阻止该 Backend 后续所有 callback 推进。per-operation thread 只能隔离 caller 的等待和执行状态，不能绕过 Backend serialization；也不能借此宣称后续 Shutdown 可以完成。
 
-其他 self-owned execution mechanism
-```
-
-但：
-
-```text
-不能依赖用户 Executor
-
-不能依赖 process-global thread pool
-
-不能让 caller 因 Backend 永久阻塞而永远无法返回 timeout
-```
-
-具体 mechanism 不冻结。
+caller 仍必须能按各自 timeout 返回，backing state 必须保留。Header Finalization / implementation review 应记录选定策略、资源预备方式和阻塞边界，不改变上述公共语义。
 
 ---
 
-## 3.36 Lifecycle Shutdown
+## 3.48 Control execution 创建失败
+
+Flush 为单次请求准备 control state / execution 时，若发生 `std::bad_alloc` 或资源类 `std::system_error`，返回 ResourceExhausted；无法分类的执行创建错误返回 InternalError，不得逃出 noexcept。
+
+请求发布前完成可失败准备。准备失败不留下无人执行的 barrier、completion 或 ownership，也不改变 Context lifecycle；之后 Flush / Shutdown 可以正常重试。
+
+Shutdown 所需 completion 与保证 cleanup 能被执行的资源，在 Create 成功前准备完毕。Shutdown cut、析构 initiation 和 move assignment 旧 state release 不得依赖新的 allocation / thread creation；它们不能因控制资源创建失败而留下无人推进的 Pending。若某种 lazy/per-operation 策略需要这些资源，必须提供已经准备好的 cleanup 执行路径。
+
+错误 Status 必须支持不带 Diagnostic 的 no-allocation 构造；错误报告时 Diagnostic allocation 失败只能省略 Diagnostic，不得导致 noexcept terminate。Backend control API 与动态 category API 的错误路径遵循相同规则。
+
+---
+
+## 3.49 Lifecycle Shutdown
 
 ```cpp
 Status Shutdown(
-    Duration timeout) noexcept;
+    rocomm::Duration timeout) noexcept;
 ```
 
-正常 shutdown：
+正常阶段：
 
 ```text
 1. Running → Stopping linearization
@@ -3985,7 +4923,8 @@ Status Shutdown(
 
 4. establish shutdown prefix
 
-5. drain/terminalize accepted records
+5. 等待所有成功 admission 的 operation 转交或 terminalize，
+   drain/terminalize queue/dispatch 接管的 records
 
 6. Backend::Flush()
 
@@ -3993,133 +4932,155 @@ Status Shutdown(
 
 8. worker/control path exits
 
-9. logical lifecycle → Stopped
+9. lifecycle → Stopped
 
-10. shutdown completion → quiescent
+10. 保存 final Status，shutdown completion → Complete
 ```
 
 ---
 
-## 3.37 Shutdown admission 线性化
+## 3.50 Shutdown admission cut
 
-真正的 shutdown admission cut 是：
+正确线性化点：
 
 ```text
 Running → Stopping
 ```
 
-atomic transition。
-
 如果 Log admission 先赢：
 
 ```text
-record accepted
+record admitted
 ```
 
-Shutdown 必须对它负责。
+Shutdown 必须负责该 operation。
 
-如果 Shutdown 先赢：
-
-```text
-new normal log
-→ rejected
-```
-
----
-
-## 3.38 CategoryEntry Off 只是优化
-
-进入 Stopping 后可以：
+如果 Shutdown transition 先赢：
 
 ```text
-遍历 CategoryEntry
-→ effective_level = Off
-```
-
-使已有 Logger 更快返回。
-
-但即使 O(n) 更新尚未完成：
-
-```text
-lifecycle == Stopping
-```
-
-已经足以禁止 admission。
-
----
-
-## 3.39 Shutdown 与 Log 并发
-
-Log 先赢：
-
-```text
-record accepted
-
-→ 必须 dispatch
-或
-按已经冻结的 overflow semantic terminalize
-```
-
-Shutdown 先赢：
-
-```text
-direct Log attempt
-→ rejected_after_stop++
-
-LogLazy / macro
-通常会因 Enabled=false
-根本不进入 builder
+新的 admission
+→ reject
 ```
 
 ---
 
-## 3.40 Shutdown completion
+## 3.51 Shutdown 不修改 Category effective level
 
-除 lifecycle 外，内部必须维护：
+V1 Shutdown 只通过 Running → Stopping admission cut 关闭接受边界，不批量把 CategoryEntry effective level 改成 Off。
 
-```text
-shutdown completion state
-```
+Category cache 始终表达已提交的 category 配置；停止状态由独立 lifecycle 表达。Enabled 看到非 Running 即返回 false；direct Log 按 §2.19 跳过停止后的 level filtering，到 admission 统一拒绝。
 
-例如：
-
-```text
-Pending
-
-Complete
-```
-
-或者等价 representation。
-
-原因是：
-
-```text
-logical Stopped
-```
-
-并不总等于：
-
-```text
-Backend 已 quiescent
-```
+这样不会因为 shutdown cache 改写而把 lifecycle rejection 混入 category filtering。未来若希望加入等价优化，必须证明不改变 filtering / rejection counters / race 契约，不能直接恢复 Off 覆盖。
 
 ---
 
-## 3.41 Shutdown timeout
+## 3.52 Shutdown 后 direct Log()
 
-如果 deadline 到达时：
+对有效、config-enabled Logger，以合法 severity 直接调用 Log，若提交路径观察到 Stopping/Stopped，则跳过 effective-level filtering，立即由 admission 拒绝：
 
 ```text
-Backend::Write
-Backend::Flush
-Backend::Shutdown
-control worker
+rejected_after_stop++
+不复制 owned message
+不构造 LogRecord
+不调用 normal Backend
 ```
 
-仍未完成：
+不要求 level 高于停止前的 category threshold；停止后的拒绝优先于 category filtering。caller 在进入 Log 前已经完成的参数表达式求值不受此保证影响。
+
+与 Shutdown 并发时，仍可能在最后一次观察 Running 时因 level 被过滤；这属于 §2.19 的合法 filtering outcome。默认 / moved-from / config-disabled Logger 是 no-op，不计 rejection。
+
+---
+
+## 3.53 Shutdown 后 LogLazy / Macro
+
+如果 LogLazy 开始执行时已经：
 
 ```text
-logical lifecycle
+lifecycle != Running
+```
+
+则：
+
+```text
+Enabled() == false
+
+builder 不执行
+
+不到 admission
+
+rejected_after_stop 不增加
+```
+
+因此：
+
+> **因 Enabled() 预检查直接被过滤的 LogLazy，不计入 `rejected_after_stop`。**
+
+---
+
+## 3.54 LogLazy 与 Shutdown 的 race
+
+合法交错：
+
+```text
+Thread A: Enabled → true
+Thread B: Running → Stopping
+Thread A: builder 正常返回
+Thread A: 内部提交观察非 Running → admission reject
+```
+
+该操作 builder 已执行，`rejected_after_stop++`，normal Backend 不被调用。
+
+若 builder 抛异常 / 返回 null const char*，则先按 frontend failure 结束，不到 admission；若在仍 Running 时被并发 category 更新过滤，也不到 admission。只有真正到达 admission 且被 lifecycle 拒绝的操作增加 rejection counter。
+
+---
+
+## 3.55 `rejected_after_stop` 正式定义
+
+表示到达 LoggingContext admission boundary、因 lifecycle 非 Running 被拒绝的 logging operation 数量。
+
+包括有效且 config-enabled Logger 在停止后的合法 direct Log，以及 builder 正常返回后输掉 admission race 的 LogLazy。
+
+不包括 Enabled 已拒绝的 lazy/macros、Running 时的 category filtering、default/moved-from/config-disabled Logger、admission 前 builder failure、非法 severity，以及 admission 已成功后发生的 frontend failure / overflow / Block shutdown cancellation。
+
+每次 admission rejection 恰好计一次。
+
+---
+
+## 3.56 Shutdown completion 与 final Status
+
+内部必须独立保存 lifecycle、shutdown completion（Pending / Complete）和不可变 final Status。
+
+Complete 最低要求：
+
+```text
+所有 admission / queue / dispatch ownership 已终结
+Backend::Flush 与 Backend::Shutdown 已按序返回（enabled Context）
+所有 Logging-owned worker/control invocation 已退出或完成
+没有仍需 LoggingState 支撑的内部工作
+```
+
+最终 Flush 失败后仍必须尝试 Backend::Shutdown，以释放资源；不得因 Flush 错误直接跳过 cleanup。
+
+结果规则：
+
+```text
+Flush 非 Ok → final Status 为该 Flush 原 Status
+否则 Shutdown 非 Ok → final Status 为该 Shutdown 原 Status
+否则 → Ok
+```
+
+两个都失败时保留 Flush 为 primary，Shutdown 为 secondary，通过 BackendStats / best-effort Diagnostic 报告，不覆盖 primary。Diagnostic 不能引入 allocation failure。
+
+Complete 只表示 quiescent，不保证 output 成功。所有 joiner、重复 Shutdown 和 join shutdown 的 Flush 观察同一 final Status；caller 的 Timeout 不覆盖最终结果。disabled Context 无 Backend，final Status 为 Ok。
+
+---
+
+## 3.57 Shutdown timeout
+
+deadline 到达而 cleanup 未完成：
+
+```text
+lifecycle
 → Stopped
 
 shutdown completion
@@ -4129,125 +5090,65 @@ Shutdown()
 → Timeout
 ```
 
----
-
-## 3.42 Repeated Shutdown
-
-如果已经：
-
-```text
-Stopped
-+
-shutdown completion == Complete
-```
-
-再次：
-
-```cpp
-Shutdown(timeout);
-```
-
-返回：
-
-```text
-Ok
-```
-
-如果：
-
-```text
-Stopped
-+
-shutdown completion == Pending
-```
-
-则新的 Shutdown：
-
-> **join 同一个 shutdown completion。**
-
-如果 cleanup 在新 timeout 内完成：
-
-```text
-Ok
-```
-
-如果仍未完成：
-
-```text
-Timeout
-```
-
-因此：
-
-> **Repeated Shutdown joins shutdown completion，而不是只观察 logical lifecycle state。**
+logical Stopped 不表示 Backend 已经 quiescent。
 
 ---
 
-## 3.43 Concurrent Shutdown
+## 3.58 Repeated Shutdown
 
-多个线程同时 Shutdown：
+Stopped + Complete 时立即返回保存的 shutdown final Status，可能是 Ok，也可能是 Backend control failure；不重新调用 Backend::Shutdown，也不把历史失败改成 Ok。
 
-```text
-只有一个 shutdown initiator
-```
-
-其他 caller：
+Stopped / Stopping + Pending 时 join 同一个 completion，每次从自己的调用开始重新计算 timeout。
 
 ```text
-join same completion
+first Shutdown(100 ms) → Timeout
+cleanup 随后成功
+second Shutdown(5 s) → Ok
+
+first Shutdown → Backend control failure，Complete
+second Shutdown → 同一个 failure
+
+first Shutdown → Timeout
+second Shutdown 时仍 Pending 且本次 deadline 到达 → Timeout
 ```
 
-各 caller 使用自己的 timeout 等待。
-
-可以出现：
-
-```text
-Caller A:
-Timeout
-
-Caller B:
-稍后等待更久
-→ Ok
-```
-
-这是合法的。
+每个 caller 的 Timeout 仅描述本次等待，不写入共享 final Status。
 
 ---
 
-## 3.44 Shutdown timeout 后的 worker
+## 3.59 Concurrent Shutdown
 
-超时以后：
+多个 caller：
 
 ```text
-后台 worker/control task
-继续完成清理
+只有一个 initiator
 ```
 
-但：
+其余：
 
 ```text
-不修改已经返回给 caller 的 Status
+join same shutdown completion
 ```
 
-它只继续更新：
+每个 caller 使用自己的 timeout。
+
+不得多次执行：
 
 ```text
-内部 shutdown completion
-stats
+Backend::Shutdown()
 ```
 
 ---
 
-## 3.45 Timeout 后 Backend 生命周期
+## 3.60 Timeout 后 Backend lifetime
 
-如果 Shutdown timeout：
+如果 Shutdown Timeout：
 
 ```text
 LoggingContext wrapper
 可以继续存在或销毁
 
-logical lifecycle
-= Stopped
+lifecycle = Stopped
 ```
 
 但：
@@ -4255,9 +5156,9 @@ logical lifecycle
 ```text
 Backend
 
-queue backing
+Category registry
 
-category storage
+Queue
 
 worker/control state
 ```
@@ -4266,45 +5167,51 @@ worker/control state
 
 因此：
 
-> **LoggingContext wrapper 析构不等于 Backend 对象立即析构。**
+> **LoggingContext wrapper 析构不等于 Backend 立即析构。**
 
 ---
 
-## 3.46 Self-owned worker state
+## 3.61 Self-owned LoggingState
 
-实现必须采用安全 lifetime 机制，例如：
-
-```text
-shared WorkerState
-
-self-owned control state
-
-deferred destruction
-```
-
-参考概念：
+概念 ownership：
 
 ```text
 LoggingContext wrapper
       ↓ strong
 LoggingState
 
-worker/control thread
+Logger
+      ↓ state handle
+LoggingState
+
+worker/control execution
       ↓ strong
-same LoggingState
+LoggingState
 
 LoggingState
       ↓ owns
 Backend
-Category storage
+Category registry
 Queue
 ```
 
-wrapper 可以销毁，但 worker 仍保持必要 backing。
+Shutdown transition 决定：
+
+```text
+是否继续接受 logging
+```
+
+引用计数只决定：
+
+```text
+内存何时可以安全回收
+```
+
+两者不能混淆。
 
 ---
 
-## 3.47 Custom Backend 永久阻塞
+## 3.62 Custom Backend 永久阻塞
 
 如果 Custom Backend：
 
@@ -4319,49 +5226,41 @@ shutdown completion
 可能永远 Pending
 ```
 
-Backend state 可能保留到：
+Backend state 可能保留到进程结束。
 
-```text
-进程退出
-```
+这是 C++ 无法安全强制修复的边界。
 
-这是 C++ 无法安全强制解决的限制。
-
-Backend contract 因此明确：
+因此 Backend contract：
 
 > **Initialize/Write/Flush/Shutdown 不得无限阻塞。**
 
-违反这一条属于：
+违反该要求属于 Backend contract violation。
+
+RoComm 不使用：
 
 ```text
-Custom Backend contract violation
+pthread_cancel
+
+unsafe detach + free backing
+
+TerminateThread
 ```
 
-RoComm 仍必须保证：
-
-```text
-no UAF
-
-no double-free
-
-no std::thread destructor terminate
-```
+等方案强制回收。
 
 ---
 
-## 3.48 SpdlogBackend 的阻塞边界
+## 3.63 SpdlogBackend 阻塞边界
 
-SpdlogBackend 使用普通同步 sink。
-
-它不引入：
+SpdlogBackend 不引入：
 
 ```text
-第三方 async worker join
+spdlog async pool wait
 
-全局 async pool wait
+spdlog worker join
 ```
 
-但：
+但底层：
 
 ```text
 filesystem
@@ -4371,43 +5270,63 @@ terminal
 OS write
 ```
 
-本身仍可能异常长时间阻塞。
+仍可能异常长时间阻塞。
 
 因此：
 
-> **RoComm 不为普通文件/终端 I/O 提供严格最大阻塞时间保证。**
-
-这也是 LoggingContext timeout contract 必须存在的原因。
+> **RoComm 不承诺普通文件/终端 I/O 的严格最大阻塞时长。**
 
 ---
 
-## 3.49 LoggingContext destructor
+## 3.64 LoggingContext destructor
 
 ```cpp
 ~LoggingContext() noexcept;
 ```
 
-正式语义：
+析构：
 
-> **析构触发 safe shutdown initiation，但不阻塞等待可能永久阻塞的 Backend 完成。**
+> **发起 safe shutdown initiation，但不执行可能无界阻塞的等待。**
 
-因此：
+不要求“绝对从不 join”。
+
+如果 worker 已经：
 
 ```text
-析构
-≠
-完整 Flush guarantee
+完全退出
 ```
 
-需要明确保证日志落盘时：
+可以同步 reclaim/join。
+
+如果 worker/control invocation 仍未完成：
+
+```text
+self-owned state deferred cleanup
+```
+
+析构不能因为坏 Backend：
+
+```text
+无限卡住
+```
+
+---
+
+## 3.65 完整 Flush guarantee
+
+Destructor：
+
+```text
+不是 persistence guarantee
+```
+
+需要确认日志已经 flush 的调用方必须显式：
 
 ```cpp
 Shutdown(timeout);
 ```
 
-必须由调用方显式调用。
-
-RoComm Runtime 自己必须在：
+Runtime 自己必须在：
 
 ```text
 Runtime::Stop()
@@ -4417,7 +5336,7 @@ Runtime::Stop()
 
 ---
 
-## 3.50 LoggingStats
+## 3.66 LoggingStats
 
 ```cpp
 struct LoggingStats {
@@ -4443,174 +5362,143 @@ struct LoggingStats {
 
 ---
 
-## 3.51 `accepted`
+## 3.67 Stats counter storage
 
-表示：
+Public semantic width：
 
 ```text
-通过 global filter
-
-成功 materialize LogRecord
-
-成功进入 LoggingContext admission
+std::uint64_t
 ```
 
-DropNewest：
+内部通常可使用：
 
 ```text
-新记录未 accepted
+std::atomic<std::uint64_t>
 ```
 
-因此：
+但：
+
+> **64-bit atomic 必须 lock-free 不是跨平台 Public API contract。**
+
+在主目标平台应验证性能。
+
+如果未来某个平台不是 lock-free：
 
 ```text
-dropped_newest
-```
+功能正确性仍必须成立
 
-不包含在 `accepted` 中。
-
----
-
-## 3.52 `dispatched`
-
-表示：
-
-```text
-Backend::Write(record)
-```
-
-已经开始执行。
-
-不意味着：
-
-```text
-文件一定写成功
-```
-
-实际 Backend failure 看：
-
-```text
-backend.write_errors
+性能差异通过 benchmark / platform notes 暴露
 ```
 
 ---
 
-## 3.53 `dropped_oldest`
+## 3.68 `accepted`
 
-DropOldest 删除的是：
+accepted 统计完成 global filtering、owned frontend materialization 和 authoritative admission 后，成功转交给 dispatch/queue 的 record 数量。
+
+精确计数点：
 
 ```text
-之前已经 accepted
+Sync:
+  record 转交给受 Shutdown 跟踪的 dispatch ownership 时 +1
+  可以早于 Backend serialization / Write，Write 在 caller 执行
+
+Async:
+  record 成功取得 queue ownership 的线性化点 +1
 ```
 
-的记录。
+每条 record 只计一次。DropNewest 未入队、frontend failure、Block shutdown cancellation、admission rejection 都不计 accepted。DropOldest 删除已 accepted 的旧记录时不回减 accepted，增加 dropped_oldest；新记录成功入队时 accepted +1。
 
-因此稳定状态下：
+admission ownership 负责 lifecycle / prefix correctness，accepted 只是 record 转交统计，不能用作 Flush 同步条件。admission 成功不立即增加 accepted。
+
+---
+
+## 3.69 `dispatched`
+
+正式定义：
+
+> **`Backend::Write(record)` 已经正常返回的记录数。**
+
+不是：
 
 ```text
-accepted
-≈
-dispatched
-+
-dropped_oldest
-+
-queued
-+
-in-flight
+Write 刚开始调用的次数
 ```
 
-由于 stats 是 eventually consistent：
+即使 Backend 内部遇到 I/O failure，但：
 
 ```text
-不要求瞬时严格等式
+Write() 按 contract 正常返回
+```
+
+仍：
+
+```text
+dispatched++
+```
+
+同时：
+
+```text
+backend.write_errors++
 ```
 
 ---
 
-## 3.54 `accepted - dispatched` 不能直接当 backlog
-
-因为：
+## 3.70 Backlog diagnostic
 
 ```text
-dropped_oldest
+accepted - dispatched - dropped_oldest
 ```
 
-已经从 queue 移除。
+在 counters 未溢出、工作静止且读取稳定快照后，等于仍被 queue / sync dispatch / in-flight Write ownership 持有的 record 数。全部 record 已终结时应为 0，包括 Backend Write 返回但报告 output error 的情况。
 
-更合理的近似：
+DropNewest、frontend failure 和 Block shutdown cancellation 不计 accepted，因此不会留下永久差额。
 
-```text
-accepted
--
-dispatched
--
-dropped_oldest
-```
-
-约等于：
-
-```text
-queued + in-flight
-```
-
-但由于不同 counter 并非单原子 snapshot：
-
-> 仍然只适合作为诊断指标，而非精确同步条件。
+并发 GetStats 是 eventually-consistent snapshot，字段可能来自不同时刻；即时差值仅供诊断，读取方应避免 uint64 下溢（例如采用饱和差值），不得据此判断 Flush/Shutdown 完成。
 
 ---
 
-## 3.55 queue_high_watermark
+## 3.71 queue_high_watermark
 
-`queue_high_watermark` 是：
+定义为：
 
 ```text
 eventually consistent diagnostic statistic
 ```
 
-不要求每次 producer Push：
+V1 不要求 producer 每次 Push：
 
 ```text
 atomic CAS max
 ```
 
----
-
-## 3.56 High-watermark 采样策略
-
-V1 推荐：
+也不向用户暴露：
 
 ```text
-producer/thread-local 轻量采样
-
-或
-
-writer 每处理 K 条记录时采样
-
-或
-
-每 N 次 push 批量发布
+sampling interval configuration
 ```
 
-允许近似。
+具体采样方式：
 
-不能让精确 high-watermark 统计成为所有 producer 的显著 hot-path 负担。
+```text
+implementation-open
+```
+
+可以在 benchmark 后调整。
 
 ---
 
-## 3.57 GetStats()
+## 3.72 GetStats()
 
 ```cpp
 LoggingStats
 GetStats() const noexcept;
 ```
 
-返回：
+返回 eventually-consistent snapshot。
 
-```text
-eventually consistent snapshot
-```
-
-不保证所有 counter 属于完全相同的时间点。
+不要求所有字段属于同一个严格时间点。
 
 ---
 
@@ -4618,7 +5506,7 @@ eventually consistent snapshot
 
 ## 4.1 LoggingBackend 是唯一 Public Backend SPI
 
-V1 不同时公开：
+V1 不同时暴露：
 
 ```text
 Custom Backend SPI
@@ -4628,26 +5516,31 @@ Custom Backend SPI
 Custom Sink SPI
 ```
 
-唯一正式扩展点：
+唯一正式 extension point：
 
 ```text
 LoggingBackend
 ```
 
-Backend 内部可以自行建立：
+Backend 内部可以自己建立：
 
 ```text
 Sink
+
 Output
+
 Channel
+
 Router
 ```
 
-这些不进入 RoComm Core Public API。
+但这些不成为 RoComm public abstraction。
 
 ---
 
 ## 4.2 LoggingBackend
+
+Public：
 
 ```cpp
 struct LoggingBackendStats {
@@ -4688,7 +5581,7 @@ public:
 
 ## 4.3 V1 不引入 LoggingBackendInitContext
 
-V1 正式保持：
+保持：
 
 ```cpp
 Initialize() noexcept
@@ -4696,37 +5589,34 @@ Initialize() noexcept
 
 无参数。
 
-原因：
-
-Backend creation-time dependency 可以由：
+Backend creation-time dependencies 通过：
 
 ```text
-LoggingBackendFactory
+LoggingBackendFactory capture
 ```
 
-capture。
+传入。
 
-例如：
+只有未来出现：
 
-```cpp
-config.SetBackendFactory(
-    [backend_config,
-     runtime_name]() mutable {
-        return logging::spdlog::
-            CreateBackend(
-                BuildConfig(
-                    backend_config,
-                    runtime_name));
-    });
+```text
+factory 无法合理提供、
+必须由 LoggingContext 在 initialization 时注入
 ```
 
-在没有明确存在“必须由 LoggingContext 在 Initialize 时注入、且 factory 无法合理提供”的资源之前：
+的明确 dependency，才重新设计职责明确的 Init contract。
 
-> **不提前引入新的 InitContext abstraction。**
+不提前增加通用：
+
+```text
+LoggingBackendInitContext
+```
+
+容器。
 
 ---
 
-## 4.4 Backend 生命周期
+## 4.4 Backend lifecycle
 
 ```text
 Constructed
@@ -4742,78 +5632,76 @@ Shutdown()
 Stopped
 ```
 
-`Initialize()`：
+Shutdown 必须能处理 Constructed、partial-initialized、Initialized 状态。第一次调用完成 cleanup 后进入 Stopped，即使返回非 Ok，也不得再接受 Write/Flush。重复 Shutdown 不再次执行 cleanup，返回保存的第一次 Shutdown Status（正常无资源 cleanup 为 Ok）。
 
-```text
-最多成功一次
-```
+LoggingContext 正常只调用一次 Backend::Shutdown；幂等要求用于 Backend contract tests 和安全 rollback。Backend 析构不得执行无界阻塞的隐式 cleanup，也不得抛异常。
 
 ---
 
-## 4.5 Initialize failure
+## 4.5 Initialize 只能成功一次
 
-Initialize 失败后：
+第一次 Initialize 成功后进入 Initialized；第二次及后续 Initialize 返回 InvalidState，保持原 Initialized 状态与资源不变，Write/Flush/Shutdown 仍正常可用。
 
-```text
-Backend 仍必须可安全析构
-```
-
-LoggingContext 可以：
-
-```text
-best-effort Backend::Shutdown()
-```
-
-Backend::Shutdown 必须能够：
-
-```text
-清理已经部分初始化的资源
-```
-
-不能假设：
-
-```text
-Initialize 一定全部成功
-```
+Initialize 不是幂等 API。Initialize 已失败或 Backend 已 Stopped 后不得重试初始化；后续 Initialize 返回 InvalidState。部分初始化失败仍必须支持安全 Shutdown 和析构。
 
 ---
 
-## 4.6 Backend API 异常规则
+## 4.6 Partial initialization
 
-以下均：
+如果 Initialize 部分完成后失败，例如：
+
+```text
+file 已打开
+
+但后续 output 创建失败
+```
+
+Backend 仍必须：
+
+```text
+可安全析构
+
+可安全调用 Shutdown()
+```
+
+`Shutdown()` 必须能清理：
+
+```text
+partial initialization resources
+```
+
+不能假定 Initialize 成功完成。
+
+---
+
+## 4.7 Backend noexcept contract
+
+以下全部：
 
 ```text
 noexcept
 ```
 
-```cpp
-Initialize()
-Write()
-Flush()
-Shutdown()
-GetStats()
+```text
+Initialize
+Write
+Flush
+Shutdown
+GetStats
 ```
 
-Backend 内部所有异常必须转换或吞入其正式错误路径。
+如果第三方库内部抛异常：
 
----
+### Initialize / Flush / Shutdown
 
-## 4.7 Write error
+捕获后按 §4.9 映射 Status（资源不足为 ResourceExhausted，无法分类的异常为 InternalError），并更新适用的对应 stats；Initialize 没有独立公共 error counter。返回错误不得依赖 Diagnostic allocation。
 
-`Write()` 返回：
+### Write
 
-```text
-void
-```
-
-因为 logging data-plane output failure：
-
-> 不允许反向修改原 communication Status。
-
-发生输出错误：
+捕获后：
 
 ```text
-BackendStats::write_errors++
+write_errors++
 ```
 
 必要时：
@@ -4822,14 +5710,61 @@ BackendStats::write_errors++
 RawLog
 ```
 
+不能让异常穿过 Backend SPI。
+
 ---
 
-## 4.8 Initialize / Flush / Shutdown error
+## 4.8 Backend Write failure
 
-这些是：
+`Write()` 返回：
 
 ```text
-Logging control-plane operation
+void
+```
+
+因为数据面日志输出失败：
+
+> **不能反向改变原 communication operation 的 Status。**
+
+例如：
+
+```text
+Publisher::Publish()
+→ Ok
+
+同时日志写文件失败
+```
+
+Publish 仍然：
+
+```text
+Ok
+```
+
+Logging failure 通过：
+
+```text
+LoggingStats
+
+BackendStats
+
+RawLog
+```
+
+观察。
+
+---
+
+## 4.9 Backend control Status
+
+以下是 Logging control-plane：
+
+```text
+Initialize
+
+Flush
+
+Shutdown
 ```
 
 因此返回：
@@ -4838,174 +5773,232 @@ Logging control-plane operation
 Status
 ```
 
-推荐：
+映射：
 
 ```text
-invalid config
+invalid backend configuration
 → InvalidArgument
 
-unsupported
+unsupported capability
 → UnsupportedConfiguration
 
 resource failure
 → ResourceExhausted
 
-internal/backend initialization failure
+unexpected third-party/backend failure
 → InternalError
 ```
 
 ---
 
-## 4.9 Backend 不负责 timeout
+## 4.10 Backend 不处理 timeout
 
-Backend：
+Backend SPI 不接受：
 
-```cpp
-Flush()
-Shutdown()
+```text
+Duration
+deadline
 ```
 
-不接收 deadline。
-
-timeout 属于：
+timeout 全部由：
 
 ```text
 LoggingContext
 ```
 
-这样 Custom Backend 不必重复实现 timeout framework。
+控制。
 
-LoggingContext 通过：
-
-```text
-self-owned control execution
-+
-completion wait
-```
-
-提供 timeout。
+这样 Backend 不需要重复实现 deadline framework。
 
 ---
 
-## 4.10 Backend invocation serialization
+## 4.11 Backend serialized invocation
 
-LoggingContext 保证：
-
-```text
-同一个 Backend instance
-```
-
-的：
+LoggingContext 保证同一个 Backend instance 的：
 
 ```text
 Initialize
+
 Write
+
 Flush
+
 Shutdown
 ```
 
-不会并发。
+不并发执行。
 
-因此 Backend 不要求：
+Backend author 因此不需要让：
 
 ```text
-Write thread-safe
+Write()
 ```
+
+本身支持多线程并发。
 
 ---
 
-## 4.11 GetStats concurrency
+## 4.12 Backend GetStats()
 
 `GetStats()`：
 
 ```text
-允许 LoggingContext 运行期间查询
+noexcept
+
+不得分配内存
+
+不得执行 I/O
 ```
 
-因此 Backend 必须：
-
-```text
-安全读取 stats
-```
-
-推荐：
+Backend stats 应来自：
 
 ```text
 atomic counters
+
+或其他 no-allocation state
 ```
 
-或者等价同步。
+不得在 `GetStats()` 内动态构造需要 heap allocation 的诊断结构。
 
 ---
 
-## 4.12 Backend 不由生产代码直接驱动
+## 4.13 Backend 不由生产代码直接驱动
 
-正常 Application 不应：
+正常生产代码不得：
 
 ```cpp
 backend->Write(...);
 ```
 
-Backend lifecycle 应由：
+Backend lifecycle 调用权属于：
 
 ```text
 LoggingContext
 ```
 
-驱动。
+Backend interface 是：
 
-这是 API contract 和 code-review rule。
+```text
+implementation extension contract
+```
+
+而不是普通业务 API。
 
 ---
 
-## 4.13 Custom Backend 单元测试
+## 4.14 Custom Backend 单元测试
 
 测试代码允许：
 
 ```text
 直接构造 Backend
 
-直接调用：
-Initialize
-Write
-Flush
-Shutdown
+直接调用 Initialize
+
+构造测试 LogRecord
+
+调用 Write
+
+调用 Flush
+
+调用 Shutdown
 ```
 
-用于 Backend 自身 unit test。
+用于验证 Backend 自身。
 
-但 Logging integration test：
+LoggingContext integration test 必须：
 
-> **必须通过 LoggingContext 驱动。**
+```text
+通过 LoggingContext 驱动 Backend
+```
 
 ---
 
-## 4.14 Backend Contract Test Harness
+## 4.15 Backend Contract Test Harness
 
-RoComm repository 提供非安装测试辅助：
+仓库提供非安装测试 helper：
 
 ```text
 tests/support/logging/backend_contract.hpp
 ```
 
-例如：
+接口形状：
 
 ```cpp
-RunBackendContractTests(
-    BackendFactory factory);
+void RunBackendContractTests(
+    LoggingBackendFactory factory);
 ```
 
-用于统一检查第三方或内置 Backend。
+具体测试框架适配可以另包一层。
 
-该测试 helper：
+该 helper：
 
 ```text
-不是 Public Runtime API
+不属于 installed Runtime API
 ```
 
 ---
 
-## 4.15 TextFormatter
+## 4.16 LoggingBackendStats 语义
+
+`write_calls`：
+
+```text
+Backend::Write() 被调用次数
+```
+
+`write_errors`：
+
+```text
+Write 内部遇到 output/rendering failure 次数
+```
+
+`flush_errors`：
+
+```text
+Backend::Flush() 返回非 Ok 次数
+```
+
+`shutdown_errors`：
+
+```text
+Backend::Shutdown() 返回非 Ok 次数
+```
+
+同一次 Write 可以：
+
+```text
+write_calls++
+write_errors++
+```
+
+---
+
+## 4.17 LoggingBackendStats 内部原子实现
+
+Public：
+
+```text
+std::uint64_t
+```
+
+snapshot。
+
+Backend 内部通常：
+
+```text
+std::atomic<std::uint64_t>
+```
+
+但：
+
+> **是否 `is_always_lock_free` 不属于 Public contract。**
+
+主目标平台通过 benchmark / CI 确认性能即可。
+
+---
+
+## 4.18 TextFormatter
 
 private：
 
@@ -5023,9 +6016,9 @@ public:
 
 ---
 
-## 4.16 TextFormatter output contract
+## 4.19 TextFormatter output contract
 
-`Format()` 开始时：
+每次 Format 开始：
 
 ```text
 output.clear()
@@ -5037,7 +6030,7 @@ output.clear()
 return true
 
 output
-→ 一条完整日志行
+→ 一条完整 rendered log line
 ```
 
 失败：
@@ -5048,59 +6041,110 @@ return false
 
 此时：
 
+> **caller 必须完全忽略 output 内容。**
+
+它可能：
+
 ```text
-output 内容不得被 caller 当作合法日志使用
+为空
+
+或
+
+含 partial intermediate data
 ```
 
-可以为空，也可以包含中间 partial data。
+但不能继续输出。
 
 ---
 
-## 4.17 TextFormatter failure
+## 4.20 TextFormatter exception containment
 
-例如：
+Formatting 可能遇到：
 
 ```text
 allocation failure
 
 time conversion failure
 
-unexpected rendering failure
+unexpected formatting failure
 ```
 
-导致：
+必须：
 
 ```text
-Backend formatting/error stats++
-RawLog minimal fallback
+catch internally
+
+return false
 ```
 
-不抛异常。
+Backend：
+
+```text
+更新 error stats
+
+RawLog best effort
+```
+
+不能抛异常。
 
 ---
 
-## 4.18 Default text format
+## 4.21 Local time implementation
+
+`LogTimeZone::Local`：
+
+POSIX：
+
+```text
+localtime_r
+```
+
+Windows：
+
+```text
+localtime_s
+```
+
+禁止使用：
+
+```text
+localtime()
+```
+
+这种共享静态状态接口。
+
+---
+
+## 4.22 Default text format
 
 推荐：
 
 ```text
-2026-10-26T14:35:20.123456+09:00 [INFO] [rocomm.fastdds.discovery] [tid=18342] Participant matched [discovery.cpp:217]
+2026-10-26T14:35:20.123456+08:00 [INFO] [rocomm.fastdds.discovery] [tid=18342] Participant matched [discovery.cpp:217]
 ```
 
-V1 不冻结具体空格数量等微观格式作为兼容 ABI。
+V1 不把：
+
+```text
+精确空格数量
+
+括号风格
+```
+
+冻结成兼容 ABI。
 
 冻结的是：
 
 ```text
-TextFormatConfig 中启用的字段
-必须按配置存在
+TextFormatConfig 启用字段
+必须按配置出现在 rendered output
 ```
 
 ---
 
-## 4.19 Output-specific filtering
+## 4.23 Output-specific filtering
 
-每个 output 可以设置：
+每个 output 可以：
 
 ```text
 min_level
@@ -5116,21 +6160,13 @@ file:
 Debug+
 ```
 
-属于：
+这是第二层 filtering。
 
-```text
-第二层 filtering
-```
-
-不能重新产生：
-
-```text
-LoggingContext 已经在 global filter 阶段丢弃的 Debug
-```
+它不能重新启用 global filtering 已经丢弃的 record。
 
 ---
 
-## 4.20 SpdlogBackend
+## 4.24 SpdlogBackend
 
 V1 production Backend：
 
@@ -5140,22 +6176,23 @@ SpdlogBackend
 
 但：
 
-> **spdlog 只是实现细节。**
+> **spdlog 是实现细节，不是 RoComm Logging API。**
 
-Public Core headers 不出现：
+Public Core header 不出现：
 
 ```text
 spdlog::*
+
 fmt::*
 ```
 
 ---
 
-## 4.21 SpdlogBackend Public Surface
+## 4.25 SpdlogBackend Public API
 
-不公开具体 Backend class。
+不公开具体 class。
 
-只公开 factory：
+只公开：
 
 ```cpp
 namespace rocomm::logging::spdlog {
@@ -5173,55 +6210,75 @@ CreateBackend(
 include/rocomm/logging/backends/spdlog.hpp
 ```
 
-该头文件自身也不能 include spdlog。
+该 header：
+
+```text
+也不得 include spdlog headers
+```
 
 ---
 
-## 4.22 SpdlogBackend 配置 validation
+## 4.26 SpdlogBackend validation
 
-至少验证：
+`CreateBackend()` 验证：
 
 ```text
 outputs 非空
 
 File path 非空
 
+Rotating path 非空
+
 rotation size > 0
 
-rotation count 合法
+rotation archive count > 0
 
-所有 LogLevel 合法
+LogLevel values 合法
 ```
 
-失败：
+非法：
 
 ```text
 InvalidArgument
 ```
 
+资源创建失败：
+
+```text
+ResourceExhausted
+或
+InternalError
+```
+
+根据实际失败类型映射。
+
 ---
 
-## 4.23 SpdlogBackend 内部约束
+## 4.27 SpdlogBackend 内部约束
 
 正式禁止：
 
 ```text
 spdlog::async_logger
 
-spdlog global async thread pool
-
 spdlog global logger registry
 
-spdlog global set_level
+spdlog::register_logger()
 
-spdlog global shutdown
+spdlog::set_level()
 
-process-global mutable spdlog configuration
+spdlog::shutdown()
+
+spdlog::init_thread_pool()
+
+spdlog global async thread pool
+
+其他 process-global mutable logging configuration
 ```
 
 ---
 
-## 4.24 SpdlogBackend 使用同步 logger
+## 4.28 SpdlogBackend 使用 synchronous logger
 
 内部使用：
 
@@ -5229,82 +6286,65 @@ process-global mutable spdlog configuration
 synchronous spdlog::logger
 ```
 
-因为 RoComm 已经在 LoggingContext 层提供：
+因为 RoComm 已经负责：
 
 ```text
-async queue
+queue
+
 writer
+
 overflow
+
+flush
+
 shutdown
 ```
 
 ---
 
-## 4.25 Caller metadata
+## 4.29 Caller metadata
 
-Async 时调用 spdlog 的线程是：
-
-```text
-RoComm writer/control thread
-```
-
-因此不能让 spdlog 自己生成：
+Async 时调用 spdlog 的线程：
 
 ```text
-caller timestamp
-caller thread ID
-caller source
+RoComm logging worker/control execution
 ```
 
-正确路径：
+不是原 caller。
+
+因此 timestamp/thread/source 必须：
 
 ```text
-caller
-↓
-LogRecord captures metadata
-↓
-TextFormatter
-↓
-final line
-↓
-spdlog output
+在 caller 产生 LogRecord 时保存
 ```
+
+不能由 spdlog output 时重新推导。
 
 ---
 
-## 4.26 spdlog pattern
+## 4.30 spdlog pattern
 
-内部建议：
+内部使用类似：
 
 ```text
 %v
 ```
 
-有 color 时可以：
+color：
 
 ```text
 %^%v%$
 ```
 
-只负责：
-
-```text
-输出 RoComm 已渲染 line
-```
+只输出 RoComm TextFormatter 已生成的完整 line。
 
 ---
 
-## 4.27 Spdlog error handler
+## 4.31 Spdlog error handler
 
-必须安装 backend-local error handling。
+必须使用 backend-local error handling。
 
-发生：
-
-```text
-spdlog output failure
-```
-
-时：
+发生第三方输出失败：
 
 ```text
 write_errors++
@@ -5316,17 +6356,17 @@ write_errors++
 throttled RawLog
 ```
 
-禁止：
+不得调用：
 
 ```text
-通过普通 RoComm Logger 报告
+普通 RoComm Logger
 ```
 
-否则可能形成 recursion。
+否则可能 Backend recursion。
 
 ---
 
-## 4.28 Spdlog global API CI 检查
+## 4.32 Spdlog symbol scan
 
 Linux CI 对：
 
@@ -5334,15 +6374,17 @@ Linux CI 对：
 rocomm_logging_spdlog
 ```
 
-执行：
+进行：
 
 ```text
 nm
 objdump
-或等价符号扫描
+或等价工具
 ```
 
-禁止引用明确列出的 global APIs，例如：
+检查禁止 global API dependency。
+
+至少覆盖：
 
 ```text
 spdlog::shutdown
@@ -5350,27 +6392,21 @@ spdlog::shutdown
 spdlog::register_logger
 
 spdlog::set_level
+
+spdlog::init_thread_pool
 ```
 
-以及已列入禁止表的 global async 初始化符号。
-
-Windows / macOS：
+该检查属于：
 
 ```text
-可以使用平台等价工具
+architecture regression guard
 ```
 
-如果 CI 暂无等价能力：
-
-```text
-允许暂时只在 Linux 执行符号扫描
-```
-
-但 runtime multi-context test 仍必须在支持平台运行。
+不能替代 runtime isolation test。
 
 ---
 
-## 4.29 RawLog 定位
+## 4.33 RawLog 定位
 
 RawLog 用于：
 
@@ -5385,16 +6421,16 @@ frontend allocation failure
 
 late teardown
 
-user callable exception terminate path
+user callable exception terminate path（仅限已证明 nonblocking 的 emergency 路径，见 §5.12）
 
-internal invariant fail-fast
+internal invariant diagnostic（必须 fail-fast 时遵循 §5.12）
 ```
 
-不是 Application 普通 logging API。
+不是 Application 常规日志 API。
 
 ---
 
-## 4.30 RawLog 约束
+## 4.34 RawLog 约束
 
 尽可能满足：
 
@@ -5420,64 +6456,95 @@ low-level stderr write
 
 ---
 
-## 4.31 Linux RawLog
+## 4.35 Linux RawLog
 
 推荐：
 
 ```text
 fixed stack buffer
 ↓
-bounded formatting
+bounded snprintf-style formatting
 ↓
 write(STDERR_FILENO, ...)
 ```
 
----
-
-## 4.32 EINTR
-
-POSIX `write()`：
+禁止：
 
 ```text
-如果返回 EINTR
-→ retry
+std::string
+
+iostream
+
+normal Logger
+
+spdlog
 ```
-
-直到：
-
-```text
-成功写入
-
-发生非 EINTR error
-
-或完成允许的 bounded retry path
-```
-
-RawLog 不因 EINTR 直接静默失败。
 
 ---
 
-## 4.33 RawLog 的 portable boundary
+## 4.36 EINTR
 
-不同平台允许使用不同：
+POSIX `write()` 返回：
+
+```text
+EINTR
+```
+
+时必须允许 retry。
+
+但 retry：
+
+> **必须有限。**
+
+禁止：
+
+```text
+while (errno == EINTR) forever
+```
+
+exact retry count / time budget：
+
+```text
+implementation constant
+```
+
+不进入 Public API。
+
+首版实现可以采用小的固定次数。
+
+持续失败后：
+
+```text
+best-effort abandon
+```
+
+不能 panic 或递归报告。
+
+---
+
+## 4.37 RawLog portable boundary
+
+不同平台可以使用不同：
 
 ```text
 low-level stderr writer
 ```
 
-V1 不宣称：
+V1 不宣称 RawLog：
 
 ```text
-完全 async-signal-safe
+完整 async-signal-safe
 ```
 
-只保证：
+只冻结：
 
-> **比正常 Logging pipeline 更低层，并可在正常 pipeline 不可用时 best-effort 输出。**
+> **RawLog 比正常 pipeline 更低层，并能在普通 Logging 已不可用时 best-effort 输出。**
+
+普通 RawLog 的 OS write 仍可能阻塞；固定 buffer 和有限 EINTR retry 只限制格式化空间与重试次数，不保证总调用时间。fail-fast 不得依赖这个可能阻塞的路径，见 §5.12。
 
 ---
 
-## 4.34 Recursion behavior
+## 4.38 Backend recursion
 
 Backend invocation thread：
 
@@ -5485,44 +6552,34 @@ Backend invocation thread：
 BackendInvocationGuard active
 ```
 
-如果 Backend 内再次调用 Logger：
+Backend 再调用 Logger：
 
 ```text
-跳过 normal LoggingContext
+normal pipeline 不递归
 
-RawLog
+RawLog fallback
 
 recursive_fallbacks++
 ```
 
-不得：
+禁止：
 
 ```text
 重新 enqueue
 
-重新调用 Backend
+重新调用同一 Backend
 
-重新 Block
-```
-
-尤其避免：
-
-```text
-writer
-→ Backend
-→ Logger
-→ Block queue
-→ writer 等自己
+Block queue
 ```
 
 ---
 
-## 4.35 Frontend allocation failure
+## 4.39 Frontend allocation failure
 
-Logger message materialization 可能：
+Logger message materialization：
 
 ```text
-std::bad_alloc
+可能 bad_alloc
 ```
 
 Logger API：
@@ -5540,7 +6597,7 @@ frontend_failures++
 Error / Critical：
 
 ```text
-RawLog fallback
+RawLog minimal fallback
 ```
 
 Trace / Debug / Info / Warn：
@@ -5549,7 +6606,7 @@ Trace / Debug / Info / Warn：
 safe drop
 ```
 
-不能把 allocation exception 传播给通信 Runtime。
+不得传播异常给通信 Runtime。
 
 ---
 
@@ -5561,7 +6618,7 @@ safe drop
 RuntimeState
     ↓ owns
 LoggingContext
-    ↓ owns
+    ↓ owns/controls
 LoggingState
     ├── lifecycle/admission state
     ├── CategoryLevels
@@ -5571,75 +6628,98 @@ LoggingState
     └── LoggingBackend
 ```
 
-Middleware 不获得：
+Logger 和 worker/control execution 可以继续：
 
 ```text
-LoggingContext*
+保持 LoggingState lifetime
 ```
 
-只获得：
+但不能改变其 lifecycle。
 
-```text
-Logger
-```
+即：
+
+> **引用可以延长内存寿命，但不能延长 Running 生命周期。**
 
 ---
 
 ## 5.2 Middleware integration
 
-Middleware 初始化时：
+Middleware 应在：
+
+```text
+Initialize
+```
+
+阶段取得其整个生命周期所需要的 Logger。
+
+例如：
 
 ```cpp
 auto logger_result =
-    context.GetLogger(
+    logging_context.GetLogger(
         "rocomm.fastdds");
 ```
 
-或者 MiddlewareInitContext 已经提供对应 Logger。
-
-如果：
+成功后：
 
 ```text
-GetLogger
-→ failure
+Middleware 保存 Logger
 ```
-
-例如官方 category 配置错误或 allocation failure：
-
-```text
-Middleware initialization
-→ failure
-```
-
-不能默默得到一个无效 Logger。
 
 ---
 
-## 5.3 Middleware 权限边界
+## 5.3 Middleware shutdown 不再 GetLogger
 
-Middleware 不能：
+Middleware shutdown 阶段：
 
 ```text
-切换 Backend
-
-修改 Logging queue
-
-关闭 LoggingContext
-
-直接管理 writer
-
-调用 Runtime-wide Shutdown
+不得临时向 LoggingContext 请求新的 Logger
 ```
+
+而应复用：
+
+```text
+Initialize 阶段已经持有的 Logger
+```
+
+Runtime Stop 顺序确保：
+
+```text
+Middleware Shutdown
+发生在
+LoggingContext Shutdown
+之前
+```
+
+所以已持有 Logger 正常可用。
+
+---
+
+## 5.4 Middleware 权限边界
 
 Middleware 只能：
 
 ```text
-使用自己的 Logger
+使用 Logger
+```
+
+不能：
+
+```text
+更换 Backend
+
+修改 Queue
+
+关闭 LoggingContext
+
+管理 Logging worker
+
+执行 Runtime-wide Logging shutdown
 ```
 
 ---
 
-## 5.4 Runtime Create 顺序
+## 5.5 Runtime Create 顺序
 
 推荐：
 
@@ -5661,31 +6741,31 @@ Middleware Start
 Runtime Running
 ```
 
-这样：
+因此：
 
 ```text
-Executor 初始化
-Middleware 初始化
-Route/type 初始化
+Executor initialization
+
+Middleware initialization
+
+Route/type initialization
 ```
 
-都可以使用正常 Logging。
+都可以记录正常日志。
 
 ---
 
-## 5.5 Logging 初始化失败
+## 5.6 Logging 初始化失败
 
-如果用户显式配置：
+用户显式配置 Backend：
 
 ```text
 Custom Backend
 
-SpdlogBackend file output
-
-其他 Backend 参数
+Spdlog file Backend
 ```
 
-而初始化失败：
+初始化失败：
 
 ```text
 Runtime::Create()
@@ -5700,18 +6780,18 @@ silent fallback to console
 silent fallback to Noop
 ```
 
+显式用户意图必须被尊重。
+
 ---
 
-## 5.6 Runtime Stop 中 Logging 的位置
-
-正常 Runtime shutdown：
+## 5.7 Runtime Stop 顺序
 
 ```text
 1. reject new communication operation
 
 2. stop new receive dispatch
 
-3. terminalize pending operation
+3. terminalize pending communication operation
 
 4. stop/drain user execution
 
@@ -5719,112 +6799,107 @@ silent fallback to Noop
 
 6. complete Executor shutdown
 
-7. LoggingContext::Shutdown(
-       remaining deadline)
+7. 始终发起 LoggingContext::Shutdown(
+       remaining deadline，包括 remaining=0)
 
 8. Runtime logical Stopped
 ```
 
 ---
 
-## 5.7 Middleware/Executor shutdown 日志
+## 5.8 Middleware / Executor shutdown logging
 
 正式冻结：
 
-> **Middleware shutdown 和 Executor shutdown 期间 LoggingContext 仍处于正常可用状态。**
+> **Middleware 和 Executor shutdown 期间 LoggingContext 仍处于正常 Running 状态。**
 
 因此：
 
 ```text
-Middleware shutdown error
+shutdown warning
 
-Executor shutdown warning
+resource cleanup error
 
-resource cleanup diagnostic
+Middleware stop diagnostics
 ```
 
-仍进入正常 Logging pipeline。
-
-只有这些阶段结束后才关闭 Logging。
+仍进入普通 pipeline。
 
 ---
 
-## 5.8 Shutdown 期间大量日志
+## 5.9 Shutdown 阶段大量日志
 
-如果 Middleware shutdown 产生大量日志：
+Middleware/Executor shutdown 产生大量日志时：
 
 ```text
-AsyncQueue 仍按正常 overflow policy
+仍按正常 queue capacity 和 overflow policy
 ```
 
 处理。
 
-不会为了 shutdown：
+不会自动：
 
 ```text
-临时切换 Block
-临时改 queue capacity
+扩大 queue
+
+切换 Block
+
+修改 overflow policy
 ```
 
-因此仍可能：
+如果 Error/Critical 因 overflow 被 DropNewest 或 DropOldest：
 
 ```text
-DropNewest
-DropOldest
+RawLog fallback
 ```
 
-对应 stats 和 RawLog fallback。
+仍然生效。
 
 ---
 
-## 5.9 Runtime timeout 下 late log
+## 5.10 Runtime timeout 下 late Logger
 
-如果 Runtime shutdown timeout 时仍有：
-
-```text
-in-flight user callback
-```
-
-而 LoggingContext 已经：
+如果 Runtime shutdown 已超时，而仍有 in-flight user callable：
 
 ```text
-Stopping / Stopped
+LoggingContext
+可能已经 Stopping / Stopped
 ```
 
-旧 Logger：
+已有 Logger：
 
 ```text
-Enabled()
-→ false
-
-Log()
-→ safe no-op
+Enabled() → false
 ```
 
-这些 timeout 后 late logs：
+direct `Log()`：
+
+```text
+有效且 config-enabled Logger，合法 severity
+→ 跳过停止后的 level filtering，最终 admission reject
+→ safe no-op from Backend perspective
+```
+
+这些 late normal logs：
 
 ```text
 不保证持久化
 ```
 
-Fatal/invariant 仍可：
-
-```text
-RawLog
-```
+Fatal/invariant 若必须 fail-fast，遵循 §5.12：仅可选使用已证明 nonblocking 的 emergency diagnostic，不能等待普通 RawLog。其他 late diagnostics 可使用普通 RawLog best effort 输出。
 
 ---
 
-## 5.10 Runtime Stop 与 Logging timeout
+## 5.11 Runtime Stop 与 Logging timeout
 
-如果 Logging shutdown 未在 Runtime 剩余 deadline 内完成：
+Logging shutdown 未在剩余 Runtime deadline 内 quiesce：
 
 ```text
 Runtime::Stop()
 → Timeout
 ```
 
-Diagnostic 可以包含：
+Diagnostic 可包含：
 
 ```text
 logging shutdown did not reach quiescence
@@ -5836,48 +6911,37 @@ Runtime：
 logical Stopped
 ```
 
-Logging Backend backing：
+Logging backing：
 
 ```text
-可以 deferred destruction
+允许 deferred cleanup
 ```
+
+即使此前 Middleware/Executor cleanup 已耗尽 deadline，Runtime 仍须无等待地发起 Logging shutdown，关闭新 admission；不能因无剩余时间而让 Logging 永久 Running。在 deadline 内完成时，若无更早的 Runtime cleanup error，Stop 传播 Logging final Status；已有 primary error 时保留它，将 Logging failure 作为 secondary diagnostic。未 quiescent 时返回 Timeout。Diagnostic allocation 失败可省略文字，不得把错误改成 Ok；本次 Timeout 不覆盖 Logging 保存的最终结果。
 
 ---
 
-## 5.11 User callable exception
+## 5.12 User callable exception
 
-如果：
+Subscriber callback、Server Handler、ResponseHandler、Future continuation 抛异常时，必须执行 fail-fast；日志输出不能成为到达 `std::terminate()` 的前置阻塞条件。
 
-```text
-Subscriber callback
+该路径不调用普通 Logger（包括 Critical），不等待 Backend、queue capacity、Flush 或 Shutdown。Sync Logger 与 Async + Block 都可能无限等待，Enabled 不能证明它们适合 fail-fast。
 
-Server Handler
-
-ResponseHandler
-
-Future continuation
-```
-
-抛异常：
+可以尝试固定大小、无 allocation、无普通 logging mutex 的 emergency diagnostic，但仅限目标平台已经证明不会阻塞的输出路径。不允许修改进程级 stderr flags 来临时制造 nonblocking；若无法保证本次 emergency write 不阻塞，则省略输出并直接 terminate。
 
 ```text
-normal Logger 可用
-→ best-effort Critical
-
-否则
-→ RawLog
-
-最终
-→ std::terminate()
+user callable exception
+↓
+optional proven nonblocking emergency diagnostic
+↓
+std::terminate()
 ```
 
-Logging failure 不得阻止 terminate。
+普通 RawLog 的 EINTR retry 有界，不代表单次 OS write 有界，因此不能无条件复用为该路径。此要求不把普通 Logger / RawLog 宣称为 hard-real-time safe。
 
 ---
 
-## 5.12 Public files
-
-建议：
+## 5.13 Public files
 
 ```text
 include/rocomm/logging/
@@ -5885,9 +6949,9 @@ include/rocomm/logging/
 ├── source_location.hpp
 ├── log_record.hpp
 ├── logger.hpp
+├── logging_backend.hpp
 ├── logging_config.hpp
 ├── logging_context.hpp
-├── logging_backend.hpp
 ├── logging_stats.hpp
 ├── macros.hpp
 │
@@ -5901,9 +6965,9 @@ include/rocomm/logging/
 
 ---
 
-## 5.13 Public header dependency
+## 5.14 Public dependency boundary
 
-上述 Public Core headers：
+Core installed headers：
 
 ```text
 不得 include spdlog
@@ -5915,17 +6979,23 @@ include/rocomm/logging/
 不得 include Boost.Log
 ```
 
-`backends/spdlog.hpp` 也只声明：
+`backends/spdlog.hpp`：
 
 ```text
-RoComm-owned factory
+也不得暴露 spdlog 类型
 ```
 
-不得暴露第三方类型。
+未来：
+
+```text
+backends/native.hpp
+```
+
+同样只能暴露 RoComm-owned types，不得引入不必要第三方 public dependency。
 
 ---
 
-## 5.14 Private source layout
+## 5.15 Private source layout
 
 ```text
 src/logging/
@@ -5934,6 +7004,8 @@ src/logging/
 │
 ├── category_levels.hpp
 ├── category_levels.cpp
+│
+├── admission.hpp
 │
 ├── async_queue.hpp
 ├── async_queue.cpp
@@ -5957,7 +7029,23 @@ src/logging/
     └── spdlog_backend.cpp
 ```
 
-不创建：
+这里的：
+
+```text
+admission.hpp
+```
+
+只是一个可能的职责文件名。
+
+实现也可以把 admission state 放入：
+
+```text
+logging_state.hpp
+```
+
+只要不因此创建不必要的小文件。
+
+不使用：
 
 ```text
 src/logging/detail/
@@ -5969,9 +7057,7 @@ src/logging/impl/
 
 ---
 
-## 5.15 CMake targets
-
-建议：
+## 5.16 CMake targets
 
 ```text
 rocomm::logging
@@ -5982,7 +7068,7 @@ rocomm::logging_spdlog
 `rocomm::logging`：
 
 ```text
-无第三方 logging dependency
+零第三方 logging dependency
 ```
 
 包含：
@@ -5994,7 +7080,9 @@ LoggingContext
 
 Category
 
-AsyncQueue
+Admission
+
+Queue
 
 Backend SPI
 
@@ -6013,9 +7101,7 @@ spdlog
 
 ---
 
-## 5.16 CMake options
-
-V1：
+## 5.17 CMake options
 
 ```text
 ROCOMM_BUILD_LOGGING
@@ -6025,31 +7111,31 @@ ROCOMM_BUILD_LOGGING_SPDLOG
 ROCOMM_LOGGING_COMPILED_LEVEL
 ```
 
-Feature macro：
+feature：
 
 ```text
 ROCOMM_HAS_SPDLOG_BACKEND
 ```
 
-V1 不定义：
+V1 不预定义：
 
 ```text
 ROCOMM_HAS_NATIVE_BACKEND
 ```
 
-直到 NativeBackend 真正存在。
+直到真正实现 NativeBackend。
 
 ---
 
-## 5.17 Default Backend 是 build policy
+## 5.18 Default Backend 是 build policy
 
-V1 build default：
+V1 default 可以：
 
 ```text
 SpdlogBackend
 ```
 
-V2 可以改成：
+V2 可以：
 
 ```text
 NativeBackend
@@ -6057,19 +7143,19 @@ NativeBackend
 
 但：
 
-> **默认 Backend 具体选择不是稳定 Public API contract。**
+> **default Backend identity 不属于稳定 Public API semantic contract。**
 
-需要确定 Backend 的用户必须：
+需要精确选择的用户必须使用：
 
-```cpp
-SetBackendFactory(...)
+```text
+SetBackendFactory()
 ```
 
 ---
 
-## 5.18 V2 NativeBackend
+## 5.19 V2 NativeBackend
 
-V2 新增：
+未来新增：
 
 ```text
 include/rocomm/logging/backends/native.hpp
@@ -6084,128 +7170,18 @@ src/logging/native/
 
 ---
 
-## 5.19 NativeBackend 复用边界
+## 5.20 NativeBackend 复用 V1 Runtime
 
-V2 必须复用：
+V2 必须直接复用：
 
 ```text
 LoggingContext
 
-AsyncQueue
+Admission semantics
 
 CategoryLevels
 
-Flush
-
-Shutdown
-
-RawLog
-
-TextFormatter
-
-TextBackendConfig
-
-Backend SPI
-
-Contract tests
-```
-
-不能建立：
-
-```text
-NativeAsyncQueue
-NativeLogger
-NativeLoggingContext
-```
-
-等第二套 runtime。
-
----
-
-## 5.20 V2 与 TextBackendConfig
-
-V1 正式冻结以后：
-
-```text
-TextFormatConfig
-
-TextBackendConfig
-
-ConsoleOutputConfig
-
-FileOutputConfig
-
-RotatingFileOutputConfig
-```
-
-不能为了 NativeBackend 实现方便随意改变语义。
-
-如果 NativeBackend 需要：
-
-```text
-fsync mode
-
-platform file permission
-
-native console flags
-
-特殊 rotation strategy
-```
-
-应定义：
-
-```cpp
-struct NativeBackendConfig {
-    TextBackendConfig text;
-
-    // Native-specific settings
-};
-```
-
-原则：
-
-> **NativeBackend 适配 V1 通用 Text contract，而不是反向修改 V1 contract。**
-
----
-
-## 5.21 V2 不改变的 V1 contract
-
-V2 不改变：
-
-```text
-LogLevel
-
-SourceLocation
-
-LogRecord
-
-Logger
-
-LogLazy
-
-Macros
-
-Category
-
-LoggingConfig core semantics
-
-LoggingContext
-
-LoggingMode
-
-LogOverflowPolicy
-
-LoggingBackend
-
-LoggingBackendFactory
-
-LoggingStats
-
-TextFormatConfig
-
-TextBackendConfig
-
-Runtime-local ownership
+AsyncQueue
 
 Flush
 
@@ -6214,53 +7190,129 @@ Shutdown
 Timeout
 
 RawLog
+
+TextFormatter
+
+TextBackendConfig
+
+LoggingBackend SPI
+
+Backend Contract Tests
 ```
+
+禁止创建：
+
+```text
+NativeLogger
+
+NativeLoggingContext
+
+NativeAsyncQueue
+```
+
+第二套 logging runtime。
 
 ---
 
-## 5.22 Quill 路线边界
+## 5.21 V2 与 TextBackendConfig
 
-Quill 的核心低延迟路线是：
+V1 冻结：
 
 ```text
-caller
-→ encode arguments
-→ per-thread queue
-→ backend
-→ delayed formatting
+TextFormatConfig
+
+ConsoleOutputConfig
+
+FileOutputConfig
+
+RotatingFileOutputConfig
+
+TextBackendConfig
 ```
 
-而 RoComm V1：
+V2 不能为了 NativeBackend 实现方便修改 V1 语义。
+
+如果 NativeBackend 需要：
+
+```text
+fsync mode
+
+native file permissions
+
+console native flags
+
+特殊 rotation strategy
+```
+
+使用：
+
+```cpp
+struct NativeBackendConfig {
+    TextBackendConfig text;
+
+    // Native-specific fields
+};
+```
+
+原则：
+
+> **NativeBackend 适配 V1 Text contract，而不是修改 V1 contract 迁就 NativeBackend。**
+
+---
+
+## 5.22 TextBackendConfig 的 V2 完整性边界
+
+V1 TextBackendConfig 只表达：
+
+```text
+通用文本输出需求
+```
+
+并不尝试提前包含：
+
+```text
+fsync
+
+file permission
+
+platform console mode
+
+平台特有文件打开 flags
+```
+
+这些本就属于 Backend-specific configuration。
+
+因此其当前字段已经足以作为：
+
+```text
+V1/V2 共用通用语义层
+```
+
+未来缺失的 Native-specific 字段：
+
+```text
+不得反向加入 V1 common config
+```
+
+除非它事实上是所有 Text Backend 都具有的通用语义，并通过新的版本化设计评审。
+
+---
+
+## 5.23 Quill / deferred formatting future note
+
+V1 LogRecord 是：
+
+```text
+owned message model
+```
+
+未来如果 profiling 证明：
 
 ```text
 caller-side message construction
-
-+
-
-backend-side record rendering
 ```
 
-二者不是同一 frontend contract。
-
-因此 V1 不加入：
-
-```text
-argument encoding
-
-format codec
-
-per-thread frontend queue
-
-deferred format metadata
-```
-
-如果未来 benchmark 证明：
-
-```text
-caller-side message construction
-```
-
-成为明显瓶颈，再单独设计：
+是重大瓶颈，可以新增：
 
 ```text
 EncodedLogRecord
@@ -6268,15 +7320,23 @@ EncodedLogRecord
 DeferredFormattingFrontend
 ```
 
-而不是现在提前承担复杂度。
+等新 primitive。
+
+原则：
+
+> **未来 deferred formatting 不通过破坏 V1 LogRecord 语义实现。**
+
+V1 LogRecord 继续保持其已冻结的 owned-message contract。
 
 ---
 
-## 5.23 V1 实施阶段
+## 5.24 Implementation phases
 
 ### L0 — Public Header Finalization
 
-最终冻结：
+本文件已经冻结语义和 Header 形状。
+
+实现以下 headers：
 
 ```text
 LogLevel
@@ -6287,23 +7347,19 @@ LogRecord
 
 Logger
 
+LoggingBackend
+LoggingBackendFactory
+
 LoggingConfig
 
 LoggingContext
 
-LoggingBackend
-
-LoggingBackendFactory
-
 LoggingStats
 
 TextFormatConfig
-
 TextBackendConfig
 
 Macros
-
-Duration 使用方式
 ```
 
 ---
@@ -6314,6 +7370,8 @@ Duration 使用方式
 
 ```text
 LoggingState
+
+Admission gate/state
 
 CategoryLevels
 
@@ -6333,7 +7391,9 @@ control-operation execution
 
 BackendInvocationGuard
 
-Flush barriers
+RawFallbackGuard
+
+Flush prefix semantics
 
 Shutdown completion
 
@@ -6369,14 +7429,22 @@ PartiallyInitializedBackend
 ```text
 LoggingContext contracts
 
-Backend SPI contracts
+Admission/Shutdown race
 
-timeout
+Backend SPI
 
-deferred destruction
+Flush
+
+Shutdown
+
+Timeout
+
+deferred lifetime
 
 recursion
 ```
+
+证明 architecture 不被 spdlog 反向塑造。
 
 ---
 
@@ -6397,7 +7465,7 @@ per-output filtering
 
 TextFormatter integration
 
-spdlog error handler
+spdlog-local error handler
 
 global API isolation
 ```
@@ -6413,7 +7481,7 @@ RuntimeConfig::SetLogging()
 
 Runtime::Create()
 
-MiddlewareInitContext
+Middleware initialization
 
 Runtime::Stop()
 
@@ -6435,13 +7503,15 @@ TSAN
 
 queue stress
 
+admission/shutdown race
+
 shutdown race
 
-multi-Runtime isolation
+multi-Runtime tests
 
 symbol scan
 
-benchmark
+benchmarks
 ```
 
 ---
@@ -6450,7 +7520,7 @@ benchmark
 
 ## 6.1 Public Header Dependency Test
 
-独立 TU：
+独立 translation unit：
 
 ```cpp
 #include <rocomm/logging/logger.hpp>
@@ -6462,95 +7532,200 @@ benchmark
 
 ```text
 spdlog
-
 fmt
 ```
 
-的环境必须成功：
+的环境必须成功编译。
 
-```text
-compile
-```
-
-这是 Backend independence 的硬验收项。
+这是 Backend independence 的硬验收条件。
 
 ---
 
-## 6.2 Default Logger tests
+## 6.2 Default Logger
+
+测试：
 
 ```text
 Logger{}
 → Enabled false
 
 Log()
-→ safe no-op
+→ no normal Backend operation
 
 LogLazy()
-→ builder 不执行
+→ builder not evaluated
+
+category()
+→ empty
 ```
 
 ---
 
-## 6.3 Logger lazy evaluation tests
+## 6.3 Lazy evaluation
 
-Enabled false：
+Runtime disabled：
 
 ```text
 builder count == 0
 ```
 
-Enabled true：
+Enabled：
 
 ```text
-builder count == 1
+builder exactly once
 ```
 
 ---
 
-## 6.4 Logger copy tests
+## 6.4 String literal LogLazy
 
-必须验证：
+验证：
+
+```cpp
+ROCOMM_LOG_INFO(
+    logger,
+    "started");
+```
+
+正常编译并输出。
+
+证明：
+
+```text
+decay-based trait
+```
+
+正确支持 string literal。
+
+---
+
+## 6.5 `std::string` move path
+
+Builder：
+
+```cpp
+[]() -> std::string {
+    return BuildLargeString();
+}
+```
+
+验证实现不会无意义：
+
+```text
+额外 copy owned message
+```
+
+可通过 instrumentation / move-counting test 检查。
+
+---
+
+## 6.6 Null `const char*`
+
+Builder 返回：
+
+```text
+static_cast<const char*>(nullptr)
+```
+
+要求：
+
+```text
+no UB
+
+frontend_failures++
+
+Error/Critical → RawLog
+
+lower level → safe drop
+```
+
+---
+
+## 6.7 Logger copy
+
+验证：
 
 ```text
 copy O(1)
 
 copy no heap allocation
 
+move O(1)
+
 move no heap allocation
 ```
 
-可以使用：
+测试可使用：
 
 ```text
-test allocator
 operator new counter
-```
 
-验证。
+或 test allocation hook
+```
 
 ---
 
-## 6.5 Logger post-stop tests
+## 6.8 Enabled hot path
+
+Benchmark / instrument：
+
+```text
+no ordinary mutex
+
+no heap allocation
+
+no Backend I/O
+
+O(1)
+```
+
+允许：
+
+```text
+lifecycle scalar atomic read
+
+effective-level scalar atomic read
+```
+
+---
+
+## 6.9 Enabled 是 advisory test
+
+用确定性同步构造 Enabled true → Shutdown cut → 正常 builder 返回 / 合法 direct submission。验证 admission reject、rejected_after_stop 恰好 +1、无 Backend Write。
+
+另测 builder failure 与 Running 时 category filtering：它们在 admission 前结束，不增加 rejected_after_stop。
+
+---
+
+## 6.10 Post-stop Logger
 
 已有 Logger：
 
 ```text
-LoggingContext Shutdown
+Context Shutdown
 ↓
-Logger Enabled false
-Logger Log safe no-op
+Enabled false
+```
+
+direct `Log()`：
+
+```text
+最终 admission reject
 ```
 
 不得：
 
 ```text
 UAF
-access destroyed CategoryEntry
+
+dangling CategoryEntry
+
+Backend Write
 ```
 
 ---
 
-## 6.6 Compile-time filtering tests
+## 6.11 Compile-time filtering
 
 构建：
 
@@ -6564,12 +7739,12 @@ ROCOMM_LOG_LEVEL_INFO
 
 ```text
 TRACE:
-logger_expr 不求值
-message_expr 不求值
+logger_expr 不执行
+message_expr 不执行
 
 DEBUG:
-logger_expr 不求值
-message_expr 不求值
+logger_expr 不执行
+message_expr 不执行
 
 INFO:
 正常执行
@@ -6577,19 +7752,19 @@ INFO:
 
 ---
 
-## 6.7 Category grammar tests
+## 6.12 Category grammar
 
-覆盖：
+合法：
 
 ```text
 rocomm
+
 rocomm.fastdds
+
 robot.control
 ```
 
-合法。
-
-以下非法：
+非法：
 
 ```text
 ""
@@ -6603,7 +7778,7 @@ robot.control
 
 ---
 
-## 6.8 Category case tests
+## 6.13 Category case sensitivity
 
 验证：
 
@@ -6615,43 +7790,27 @@ robot.Control
 robot.control
 ```
 
-Category 是：
-
-```text
-case-sensitive
-```
-
 ---
 
-## 6.9 Hierarchy tests
+## 6.14 Category hierarchy
 
 覆盖：
 
 ```text
 default
 
-exact
+exact match
 
-parent
+parent match
 
-longest dot-prefix
+longest segment prefix
 
-普通 string prefix 不匹配
-```
-
-例如：
-
-```text
-rule rocomm.fast
-
-不能匹配
-
-rocomm.fastdds
+plain string prefix must not match
 ```
 
 ---
 
-## 6.10 GetLogger tests
+## 6.15 GetLogger
 
 覆盖：
 
@@ -6665,46 +7824,91 @@ invalid category
 allocation failure
 → ResourceExhausted
 
-Context stopped
+Context Stopping/Stopped
 → RuntimeStopped
 
-Logging disabled but Context Running
+moved-from Context
+→ InvalidState
+
+enabled=false but Running
 → success disabled Logger
 ```
 
 ---
 
-## 6.11 Category storage lifetime tests
+## 6.16 Category lifetime after wrapper destruction
 
 构造：
 
 ```text
-queued LogRecord
-+
-Shutdown timeout
-+
-LoggingContext wrapper destruction
+queued record
+
+Shutdown Timeout
+
+LoggingContext wrapper destroyed
+
+all Logger wrappers destroyed
+
+worker still alive
 ```
 
-Backend 后续读取：
+Backend 后续：
 
-```text
+```cpp
 record.category()
 ```
 
-仍必须有效。
+仍必须合法。
 
-使用：
-
-```text
-ASAN
-```
-
-验证。
+ASAN 验证。
 
 ---
 
-## 6.12 Dynamic category update tests
+## 6.17 LoggingConfig category accumulation
+
+```cpp
+config
+    .SetCategoryLevel(
+        "rocomm.fastdds",
+        LogLevel::Debug)
+    .SetCategoryLevel(
+        "rocomm.service",
+        LogLevel::Warn);
+```
+
+验证：
+
+```text
+两个 category 都存在
+```
+
+不能第二次操作覆盖整个 override 集合。
+
+---
+
+## 6.18 LoggingConfig duplicate category
+
+```cpp
+config
+    .SetCategoryLevel(
+        "rocomm.fastdds",
+        LogLevel::Info)
+    .SetCategoryLevel(
+        "rocomm.fastdds",
+        LogLevel::Trace);
+```
+
+最终：
+
+```text
+rocomm.fastdds → Trace
+```
+
+验证 last-write-wins。
+
+---
+
+## 6.19 Dynamic Category update
 
 覆盖：
 
@@ -6715,94 +7919,158 @@ SetCategoryLevel
 
 ClearCategoryLevel
 
-existing Logger update
+existing Logger eventually updates
 
-new Logger uses latest level
+new Logger sees new level
 ```
 
 ---
 
-## 6.13 Strong update guarantee tests
+## 6.20 Runtime duplicate SetCategoryLevel
 
-Fault injection：
+```text
+same category
+set A
+set B
+```
+
+最终：
+
+```text
+B
+```
+
+与 LoggingConfig 行为一致。
+
+---
+
+## 6.21 Dynamic update allocation failure
+
+fault injection：
 
 ```text
 SetCategoryLevel
-→ allocation failure
+```
+
+在 commit 前 allocation 失败：
+
+```text
+ResourceExhausted
 ```
 
 要求：
 
 ```text
-ResourceExhausted
+CategoryLevels unchanged
 
-原配置保持不变
-
-已有 Logger effective level 保持原值
+existing Logger cached levels unchanged
 ```
 
 ---
 
-## 6.14 Concurrent category update
+## 6.22 SetDefaultLevel strong failure guarantee
+
+同样 fault injection 验证：
 
 ```text
-producer threads
-+
+失败时原 default level 保持
+```
+
+不得半更新。
+
+---
+
+## 6.23 Concurrent category update
+
+Producer threads：
+
+```text
+Logging
+```
+
+Control thread：
+
+```text
 SetCategoryLevel
 ```
 
-验证：
+要求：
 
 ```text
 no data race
 
 TSAN pass
 
-已有 Logger 最终观察新 level
+Logger eventually converges
 ```
 
 不要求：
 
 ```text
-瞬间 global cutover
+global instantaneous cutover
 ```
 
 ---
 
-## 6.15 Logging disabled tests
+## 6.24 LoggingConfig SetBackendFactory strong exception guarantee
+
+构造一个 copy 时抛异常的 test callable。
+
+验证：
 
 ```text
-enabled=false
-```
-
-要求：
-
-```text
-BackendFactory 调用次数 == 0
-
-no queue
-
-no writer
-
-GetLogger succeeds
-
-Enabled false
+new factory construction fails
+→ old factory remains
 ```
 
 ---
 
-## 6.16 Queue capacity validation
+## 6.25 LoggingConfig move noexcept
 
-Async：
+编译期验证 LoggingConfig 公共 move traits，并验证未被外层显式 noexcept 掩盖的实际 storage / 各成员 move traits。
+
+增加 compile-fail fixture：向被检查的 storage 注入 noexcept(false) move 成员，storage 断言必须失败。不能仅断言一个已经显式 noexcept 的 wrapper。
+
+审查自定义 move body 不包含 allocation 或潜在 throwing 调用。
+
+---
+
+## 6.26 Queue capacity
+
+验证：
 
 ```text
 capacity = 0
 → InvalidArgument
 ```
 
+以及：
+
+```text
+capacity = SIZE_MAX
+```
+
+如果 sizing overflow / allocation impossible：
+
+```text
+ResourceExhausted
+```
+
+不得 overflow 成小 allocation。
+
 ---
 
-## 6.17 Empty outputs validation
+## 6.27 Logging disabled
+
+enabled=false 验证 BackendFactory 不执行、queue/writer/control runner absent、Context Running、GetLogger success disabled、Flush/Shutdown Ok。
+
+对 Running Context 调用 SetDefaultLevel / SetCategoryLevel / ClearCategoryLevel 后，Logger 仍 disabled、LogLazy builder 不执行；停止后 Set* 返回 RuntimeStopped。
+
+停止前后 direct Log / LogLazy、递归环境中的 disabled Logger 均 safe no-op，全部数据面与 Backend counters 为零。
+
+---
+
+## 6.28 Empty outputs
 
 ```text
 TextBackendConfig.outputs.empty()
@@ -6814,20 +8082,40 @@ TextBackendConfig.outputs.empty()
 InvalidArgument
 ```
 
-不得隐式变成 NullBackend。
+不得隐式构造 NullBackend。
 
 ---
 
-## 6.18 Backend factory tests
+## 6.29 Rotation validation
 
 覆盖：
 
 ```text
-factory success
+path empty
 
-factory failure Result
+size == 0
 
-factory success + nullptr
+archive count == 0
+```
+
+均：
+
+```text
+InvalidArgument
+```
+
+---
+
+## 6.30 BackendFactory
+
+覆盖：
+
+```text
+success
+
+failure Result
+
+success + nullptr
 
 throws bad_alloc
 
@@ -6836,11 +8124,11 @@ throws std::runtime_error
 throws unknown
 ```
 
-结果：
+期望：
 
 ```text
 failure Result
-→ original Status propagated
+→ original Status
 
 success + nullptr
 → InternalError
@@ -6854,16 +8142,18 @@ other exception
 
 ---
 
-## 6.19 Create rollback tests
+## 6.31 Create rollback
 
 分别在：
 
 ```text
 Backend Initialize
 
-queue allocation
+Queue allocation
 
-writer creation
+writer startup
+
+control execution setup
 ```
 
 注入失败。
@@ -6871,20 +8161,80 @@ writer creation
 验证：
 
 ```text
-已创建资源 rollback
+partial resources cleaned
 
 Backend partial Shutdown safe
 
-无 leaked thread
+no leaked joinable thread
 
-无 leaked Backend
-
-无 half-created Context
+no half-created Context
 ```
 
 ---
 
-## 6.20 AsyncQueue tests
+## 6.32 Rollback secondary failure
+
+让 primary failure 后：
+
+```text
+Backend::Shutdown()
+```
+
+也失败。
+
+要求：
+
+```text
+Create 返回 original primary Status
+
+secondary rollback error
+→ RawLog best effort
+```
+
+---
+
+## 6.33 Admission basic race test
+
+构造：
+
+```text
+Thread A:
+direct Log reaches admission
+
+Thread B:
+Shutdown attempts Running→Stopping
+```
+
+验证只有两种合法结果：
+
+```text
+A admission wins
+→ record belongs to shutdown responsibility
+
+B Shutdown wins
+→ admission rejects
+```
+
+不得出现第三种：
+
+```text
+record 被认为 accepted
+但 Shutdown 完全遗漏它
+```
+
+---
+
+## 6.34 Admission ownership failure-release test
+
+确定性暂停在 admission 成功后、owned message / record 构造前，分别注入 materialization / construction failure；也覆盖 queue 转交前 failure 与 Block shutdown cancellation。
+
+同时建立 Flush 或发起 Shutdown，验证每次 admission 恰好一次转交或终结、prefix completion 无洞、Shutdown 不永久等待、未转交的 record 不计 accepted。
+
+LogLazy 的 builder exception 在 admission 前，必须另测，不伪装成 admission 后 allocation failure。
+
+---
+
+## 6.35 AsyncQueue basic
 
 覆盖：
 
@@ -6893,36 +8243,36 @@ empty
 
 single producer
 
-multiple producer
+multiple producers
 
 single consumer
 
-wrap around
+wrap-around
 
 bounded capacity
-
-DropNewest
-
-DropOldest
-
-Block
-
-Stop wakes Block producer
 
 writer wakeup
 ```
 
 ---
 
-## 6.21 DropNewest severity fallback
+## 6.36 DropNewest
 
-当新：
+queue full：
 
 ```text
-Error / Critical
+old queue unchanged
+
+new record dropped
+
+dropped_newest++
 ```
 
-因 queue full 被丢弃：
+---
+
+## 6.37 DropNewest Error/Critical
+
+新 Error/Critical 被丢：
 
 ```text
 dropped_newest++
@@ -6932,15 +8282,23 @@ RawLog fallback
 
 ---
 
-## 6.22 DropOldest severity fallback
+## 6.38 DropOldest
 
-当最旧 queued record：
+queue full：
 
 ```text
-Error / Critical
+oldest removed
+
+new record accepted
+
+dropped_oldest++
 ```
 
-被 DropOldest 删除：
+---
+
+## 6.39 DropOldest Error/Critical
+
+被移除 oldest 为 Error/Critical：
 
 ```text
 dropped_oldest++
@@ -6948,80 +8306,76 @@ dropped_oldest++
 RawLog fallback
 ```
 
-并仍必须：
+并确认：
 
 ```text
-删除该 oldest
-```
-
-不能改变 overflow policy。
-
----
-
-## 6.23 Block shutdown test
-
-producer：
-
-```text
-queue full
-→ blocked
-```
-
-Shutdown：
-
-```text
-wake producer
-```
-
-要求：
-
-```text
-producer exits wait
-
-no deadlock
+仍然是 oldest 被删除
 ```
 
 ---
 
-## 6.24 Sync serialization tests
+## 6.40 Block
 
-多个 caller 同时：
+queue full：
 
 ```text
-Log()
+producer waits
+```
+
+consumer 腾出 slot：
+
+```text
+producer resumes
+```
+
+---
+
+## 6.41 Block + Shutdown
+
+固定 queue 满且 producer 已成功 admission、尚未取得 queue ownership。Shutdown 唤醒 producer，验证取消入队、内部 terminalization 与 ownership release。
+
+该 producer 不增加 accepted / rejected_after_stop / dropped_newest / dropped_oldest / frontend_failures；Error/Critical 执行 best-effort RawLog fallback。此前已入队 record 继续 drain。
+
+建立覆盖该 admission 的 Flush，验证取消推进 prefix completion，不 deadlock。
+
+---
+
+## 6.42 Sync serialization
+
+多个 caller：
+
+```text
+同时 Log()
 ```
 
 验证：
 
 ```text
-Backend::Write never concurrent
+Backend::Write 不并发
 
-backend mutex serialized
-
-no data race
+Backend invocation serialized
 ```
 
 ---
 
-## 6.25 Sync blocking documentation/benchmark
+## 6.43 Sync slow Backend propagation
 
-使用 BlockingBackend：
+一个 Sync `Write()` 人为长时间阻塞。
 
-```text
-Write sleeps
-```
-
-确认：
+验证：
 
 ```text
-Sync Log caller 同步阻塞
+当前 caller 被阻塞
+
+其他 Sync caller
+在 backend serialization 上阻塞
 ```
 
-这是预期行为。
+与文档契约一致。
 
 ---
 
-## 6.26 Async ordering tests
+## 6.44 Async ordering
 
 单 producer：
 
@@ -7031,7 +8385,7 @@ B
 C
 ```
 
-Backend 正常看到：
+正常：
 
 ```text
 A
@@ -7039,7 +8393,7 @@ B
 C
 ```
 
-除非对应 record 被 overflow 丢弃。
+除非明确 overflow。
 
 多 producer：
 
@@ -7051,198 +8405,195 @@ C
 
 ---
 
-## 6.27 Recursion tests
+## 6.45 Recursion — Initialize
 
-Backend：
-
-```text
-Initialize
-Write
-Flush
-Shutdown
-```
-
-分别调用 Logger。
-
-要求：
+Backend::Initialize 内调用 Logger：
 
 ```text
-Backend invocation thread guard active
-
-normal pipeline 不递归
-
 RawLog fallback
 
-recursive_fallbacks++
-
-no deadlock
-
-no stack overflow
+normal pipeline not entered
 ```
 
 ---
 
-## 6.28 Nested recursive builder test
+## 6.46 Recursion — Write
 
-Backend：
+Backend::Write 内调用 Logger：
 
 ```text
-调用 ROCOMM_LOG_*
+RawLog
+
+no re-enqueue
+
+no deadlock
 ```
 
-该 builder 内再次调用：
+---
+
+## 6.47 Recursion — Flush / Shutdown
+
+同样验证：
 
 ```text
-ROCOMM_LOG_*
+BackendInvocationGuard
+```
+
+覆盖这两个 callback。
+
+---
+
+## 6.48 Nested Raw fallback
+
+recursive `LogLazy()` builder 再次调用 Logger。
+
+要求：
+
+```text
+RawFallbackGuard
+→ suppress nested recursion
+```
+
+不能 stack overflow。
+
+---
+
+## 6.49 Flush basic barrier
+
+构造 R1/R2 → Flush boundary → R3。验证 R1/R2 达到终态且 Backend Flush 返回后才能完成；R3 不属于等待要求。
+
+另外暂停 boundary 前已 admission、尚未构造 record 的 producer，分别让它成功、frontend failure、Block shutdown cancellation，验证 barrier 正确推进。
+
+Backend Flush 返回非 Ok 时，Context Flush 传播原 Status，不能返回 Ok。
+
+---
+
+## 6.50 Flush + concurrent producer
+
+验证 prefix boundary 在并发 producer 下仍可线性化。
+
+---
+
+## 6.51 Flush + DropOldest
+
+让 barrier 前某些 accepted record：
+
+```text
+随后被 DropOldest terminalize
+```
+
+Flush 仍必须正确完成。
+
+不能由于：
+
+```text
+completion hole / count mismatch
+```
+
+永久等待。
+
+---
+
+## 6.52 Flush control path queue-full independence
+
+让 normal queue 满。
+
+调用 Flush：
+
+```text
+Flush control progress
+仍能建立
+```
+
+证明 control signaling：
+
+```text
+不消耗普通 LogRecord capacity
+```
+
+---
+
+## 6.53 Flush timeout
+
+同时覆盖负 timeout InvalidArgument、零 timeout initiation/poll、超大 duration 饱和、单调时钟 deadline；Shutdown(0) 必须关闭 admission 并让 cleanup 继续推进。control/admission mutex 不得跨 RawLog 或 Backend I/O 持有，阻塞 emergency output 时其他 caller 仍能按 deadline 返回。
+
+BlockingBackend::Flush：
+
+```text
+阻塞超过 timeout
 ```
 
 要求：
 
 ```text
-RawFallbackGuard 阻止无限递归
+caller 按 timeout 返回
+
+Status == Timeout
+
+control state remains safe
 ```
 
 ---
 
-## 6.29 Flush barrier tests
+## 6.54 Flush timeout 包含 backend serialization wait
 
-必须验证：
+让另一个 Sync Write 持有 Backend serialization。
+
+随后调用 Flush。
+
+如果等待 serialization 本身超过 timeout：
 
 ```text
-barrier 前 accepted record
-
-全部 dispatch 或明确 dropped
-
-Backend::Flush 在 prefix terminalize 后执行
+Flush → Timeout
 ```
+
+不能在拿到 mutex 后重新开始完整 timeout。
 
 ---
 
-## 6.30 Flush + concurrent producer
+## 6.55 Sync Flush timeout
 
-producer 在 Flush barrier 前后的记录：
-
-```text
-R1
-R2
-[Flush barrier]
-R3
-R4
-```
-
-Flush 只必须等待：
+Synchronous mode：
 
 ```text
-R1
-R2
-```
-
-R3/R4 不属于该 barrier guarantee。
-
----
-
-## 6.31 Flush + DropOldest
-
-构造：
-
-```text
-barrier 前存在 record
-随后部分 record 被 DropOldest
-```
-
-Flush 仍必须：
-
-```text
-确认这些 record 已明确 terminalized
-```
-
-不能因计数混乱永久等待。
-
----
-
-## 6.32 Flush barrier 不可丢弃
-
-在：
-
-```text
-DropNewest
-DropOldest
-```
-
-高压下：
-
-```text
-Flush barrier
-```
-
-仍必须可靠完成或 timeout。
-
-不能被 overflow 丢掉。
-
----
-
-## 6.33 Flush timeout
-
-BlockingBackend：
-
-```text
-Backend::Flush()
-阻塞
+Backend::Flush 永久阻塞
 ```
 
 调用：
 
 ```text
-Flush(short_timeout)
+Flush(short timeout)
 ```
 
-要求：
+caller 必须：
 
 ```text
-Timeout
-
-caller 能按 deadline 返回
-
-后台 control operation 可以继续
+按 deadline 返回
 ```
+
+证明 control operation 不直接不可控地运行在 caller thread。
 
 ---
 
-## 6.34 Sync Flush timeout
+## 6.56 Control execution creation failure
 
-特别验证：
+模拟 Flush control state / thread resource creation failure：返回 ResourceExhausted 或无法分类时 InternalError，无 terminate、无遗留 barrier，随后 Flush 和 Shutdown 能正常完成。
 
-```text
-LoggingMode::Synchronous
-```
+Create 阶段对 shutdown completion / guaranteed cleanup execution resource preparation 注入失败，验证 Create rollback。
 
-Backend::Flush 永久/长时间阻塞。
-
-调用线程：
-
-```text
-不能永久卡死
-```
-
-必须：
-
-```text
-按 timeout 返回
-```
-
-证明 control operation 确实不直接在 caller 上执行阻塞 Backend control call。
+Create 成功后禁止后续 allocation / thread creation，验证 Shutdown initiation、wrapper 析构和 move assignment 的旧 state release 仍能关闭 admission 并推进 cleanup；不能留下没有执行者的 Pending。
 
 ---
 
-## 6.35 Normal Shutdown tests
+## 6.57 Normal Shutdown
 
-覆盖：
+验证：
 
 ```text
 Running
 → Stopping
 → Stopped
-→ quiescent
+→ completion Complete
 ```
 
 结果：
@@ -7253,126 +8604,136 @@ Ok
 
 ---
 
-## 6.36 Shutdown admission cut test
+## 6.58 Shutdown admission race
 
-构造并发：
+并发：
 
 ```text
 Log admission
 vs
-Shutdown transition
+Running→Stopping
 ```
 
-验证：
+必须：
 
 ```text
 Log wins
-→ accepted and owned by shutdown
+→ admitted and owned by shutdown
 
 Shutdown wins
 → rejected
 ```
 
-不能出现：
+不得出现：
 
 ```text
-已 accepted
-但 shutdown 看不到
+admission success
+但 shutdown 不知道该 operation
 ```
 
 ---
 
-## 6.37 Shutdown CategoryEntry optimization test
+## 6.59 Shutdown 与 Category cache
 
-即使：
+设置非 Off category threshold，执行 Shutdown，验证 category effective-level cache 不因停止被覆盖成 Off，Enabled 仍因 lifecycle 返回 false。
 
-```text
-部分 CategoryEntry 尚未更新 Off
-```
+确定性交错 direct Log 的 Running load、level load、lifecycle 复查和 shutdown cut：Running 时合法过滤不计 rejection；观察到非 Running 则到 admission 拒绝。
 
-只要 lifecycle：
+这一测试不依赖 O(n) Off 更新窗口。
+
+---
+
+## 6.60 rejected_after_stop — direct Log
+
+先完成 shutdown cut，再对有效且 config-enabled Logger，以合法 severity direct Log。分别使用原 category threshold 允许和不允许的 severity。
+
+均验证：跳过 level filtering、admission rejects、rejected_after_stop 恰好 +1、accepted 不变、没有 owned message allocation / LogRecord construction / Backend Write。
+
+分别覆盖 Stopping、Timeout 后 logical Stopped、Complete 后 Stopped。default / config-disabled Logger 不计 rejection。
+
+---
+
+## 6.61 rejected_after_stop — LogLazy already sees Stopping
+
+先进入：
 
 ```text
 Stopping
 ```
 
-`Enabled()` 也必须：
+再执行：
 
-```text
-false
-```
-
-证明 CategoryEntry Off 不是 correctness mechanism。
-
----
-
-## 6.38 Repeated Shutdown tests
-
-情况一：
-
-```text
-第一次 Shutdown
-→ Ok
-```
-
-第二次：
-
-```text
-Ok
-```
-
-情况二：
-
-```text
-第一次
-→ Timeout
-
-cleanup 后续完成
-
-第二次等待
-→ Ok
-```
-
-情况三：
-
-```text
-第一次
-→ Timeout
-
-cleanup 仍未完成
-
-第二次短 timeout
-→ Timeout
-```
-
----
-
-## 6.39 Concurrent Shutdown tests
-
-多个 caller：
-
-```text
-同时 Shutdown
+```cpp
+ROCOMM_LOG_INFO(
+    logger,
+    side_effect());
 ```
 
 要求：
 
 ```text
-一个 initiator
+Enabled() == false
 
-其他 join same completion
+side_effect() 不执行
 
-无 duplicate Backend::Shutdown
+不到 admission
+
+rejected_after_stop 不增加
 ```
 
 ---
 
-## 6.40 Shutdown timeout lifetime test
+## 6.62 rejected_after_stop — LogLazy race
+
+用测试同步点确保 Enabled 已返回 true，再让 Shutdown 完成 admission cut，随后恢复 builder 正常返回和内部提交。
+
+验证 builder 恰好一次、admission rejection 恰好 +1、accepted 不变、Backend Write 不调用。不能在 LogLazy 之前做一次无关 Enabled 调用代替实际 race。
+
+另测 builder 抛异常 / 返回 null：frontend_failures +1，不到 admission，rejected_after_stop 不变。
+
+---
+
+## 6.63 Repeated Shutdown / control final Status
+
+覆盖：
+
+```text
+first Ok → second Ok
+first Timeout → cleanup 成功 → second Ok
+first Timeout → cleanup 仍 Pending → second 按自身 deadline Timeout
+Backend final Flush failure → 仍调用 Backend Shutdown → 保存 Flush failure
+Backend Shutdown failure → 保存 Shutdown failure
+两者都失败 → Flush primary，Shutdown secondary
+Complete failure → repeated Shutdown 返回相同 failure，不再调用 Backend
+Flush 在 Stopping / Stopped join → 返回相同 final Status 或本次 Timeout
+```
+
+并发 joiners 使用各自 deadline，Timeout 不覆盖共享 final Status。
+
+---
+
+## 6.64 Concurrent Shutdown
+
+还必须交错 timed-out Flush、pending per-operation control execution 与 Shutdown；验证旧 Flush 先完成或合并到 shutdown，Backend::Shutdown 开始后无 Write/Flush，Complete 后无遗留 control invocation。
+
+验证：
+
+```text
+single initiator
+
+others join same completion
+
+Backend::Shutdown called once
+```
+
+---
+
+## 6.65 Shutdown timeout lifetime
 
 BlockingBackend：
 
 ```text
-Write 阻塞
+Write blocked
 ```
 
 Shutdown：
@@ -7384,62 +8745,103 @@ Timeout
 随后：
 
 ```text
-Context wrapper destruct
+destroy LoggingContext wrapper
+destroy Logger wrappers
 ```
 
 要求：
 
 ```text
-Backend remains alive
+Backend alive
 
-Category storage remains alive
+Category storage alive
 
 no UAF
-
-writer eventually returns
-→ deferred destruction complete
 ```
 
----
-
-## 6.41 Permanent blocking test
-
-模拟永不返回 Backend。
-
-验证至少：
+Backend 最终返回后：
 
 ```text
-caller Shutdown 能 Timeout
-
-wrapper 能析构
-
-no std::terminate from thread destruction
-
-no UAF
+deferred state cleanup
 ```
 
-测试进程可以使用受控方式结束，不等待永久 worker。
+正常完成。
 
 ---
 
-## 6.42 Backend Contract Tests
+## 6.66 Permanent blocking Backend
 
-统一验证：
+通过子进程或隔离测试进程构造永久阻塞 Backend。
+
+验证：
+
+```text
+Shutdown caller 能 Timeout
+
+LoggingContext wrapper 可以析构
+
+没有 joinable std::thread destructor terminate
+
+没有 UAF
+```
+
+测试进程本身通过 harness timeout / `_exit` 等受控手段结束。
+
+---
+
+## 6.67 Moved-from LoggingContext
+
+验证：
+
+```text
+Shutdown → Ok
+
+Flush → InvalidState
+
+GetLogger → InvalidState
+
+Set* → InvalidState
+
+GetStats → zero
+```
+
+并确认其原因分别是：
+
+```text
+Shutdown
+→ release operation
+
+Flush/GetLogger/Set*
+→ state-dependent control operation
+
+GetStats
+→ diagnostic query
+```
+
+---
+
+## 6.68 Backend Contract Test
+
+所有 Backend 必须统一验证：
 
 ```text
 Name non-empty
 
 Initialize success
 
-Initialize failure
+second Initialize → InvalidState，原 Initialized 状态不变
 
-partial initialization cleanup
+second Initialize 后 Write/Flush/Shutdown 仍可用
+
+Initialize partial failure
+
+partial Shutdown cleanup
 
 Write noexcept
 
-Write stats
+Write call accounting
 
-write error isolation
+Write failure isolation
 
 Flush
 
@@ -7447,7 +8849,11 @@ Flush failure
 
 Shutdown
 
-Shutdown idempotence
+Shutdown idempotence：重复返回第一次结果，不重复 cleanup
+
+Shutdown failure 后仍为 Stopped，不再 Write/Flush
+
+GetStats no allocation
 
 Stats concurrent read
 
@@ -7456,19 +8862,19 @@ borrowed LogRecord lifetime
 
 ---
 
-## 6.43 Custom Backend test harness
+## 6.69 Backend `GetStats()` no-allocation
 
-提供：
+使用 allocation instrumentation：
 
 ```text
-tests/support/logging/backend_contract.hpp
+GetStats()
 ```
 
-不安装为正式 Runtime API。
+不得分配 heap。
 
 ---
 
-## 6.44 TextFormatter tests
+## 6.70 TextFormatter
 
 覆盖：
 
@@ -7485,52 +8891,61 @@ source on/off
 
 function on/off
 
-Local
-
 UTC
+
+Local
 ```
 
 ---
 
-## 6.45 TextFormatter output clearing
+## 6.71 Local time concurrency
+
+并发多个 formatter：
+
+```text
+Local timezone
+```
+
+验证无：
+
+```text
+localtime shared-state race
+```
+
+TSAN pass。
+
+---
+
+## 6.72 TextFormatter output clearing
 
 输入：
 
 ```text
-output = "old"
+output = "old-content"
 ```
 
-成功 Format 后：
+Format 成功后：
 
 ```text
-output
-只包含新完整日志行
+output 只包含新日志
 ```
 
-不能：
+Format 失败：
 
 ```text
-append old content
+caller ignores output
 ```
 
 ---
 
-## 6.46 SpdlogBackend tests
+## 6.73 SpdlogBackend
 
 覆盖：
 
 ```text
-sync spdlog logger
+synchronous logger
 
 no async_logger
-
-no global registry
-
-no global set_level
-
-no global shutdown
-
-no global async pool
 
 console
 
@@ -7549,118 +8964,174 @@ caller source retained
 
 ---
 
-## 6.47 Multi-SpdlogBackend isolation
+## 6.74 Spdlog global isolation
+
+验证：
+
+```text
+no global registry
+
+no global set_level
+
+no global shutdown
+
+no global async pool
+
+no init_thread_pool
+```
+
+---
+
+## 6.75 Multi-SpdlogBackend isolation
 
 创建：
 
 ```text
 Context A
+
 Context B
 ```
 
-使用不同 Backend。
+不同 Backend/config。
 
 验证：
 
 ```text
-A shutdown
-不影响 B
+A shutdown 不影响 B
 
-A error handler
-不影响 B
+A error handler 不影响 B
 
-A category
-不影响 B
+A category config 不影响 B
 ```
 
 ---
 
-## 6.48 Spdlog symbol scan
+## 6.76 Spdlog symbol scan
 
-Linux CI 检查禁止 global API dependency。
+Linux CI 对 Backend object/library 执行符号扫描。
 
-这是：
-
-```text
-architecture regression guard
-```
-
-不是普通功能测试替代品。
+禁止出现预定义 global API dependency。
 
 ---
 
-## 6.49 RawLog tests
+## 6.77 RawLog basic
 
 覆盖：
 
 ```text
-normal output
+normal stderr
 
 long message truncation
 
-EINTR retry
-
 logging unavailable
 
-recursion
-
-backend failure
+Backend recursion
 
 late teardown
 ```
 
 ---
 
-## 6.50 RawLog no-allocation test
+## 6.78 RawLog EINTR
 
-支持的平台：
+通过 syscall shim / test wrapper 模拟连续：
+
+```text
+EINTR
+```
+
+验证：
+
+```text
+有限 retry
+
+最终不会 infinite loop
+```
+
+---
+
+## 6.79 RawLog no allocation
+
+支持平台通过：
 
 ```text
 operator new instrumentation
 ```
 
-验证 RawLog 不触发 heap allocation。
+验证：
+
+```text
+RawLog
+→ zero heap allocation
+```
 
 ---
 
-## 6.51 Allocation failure tests
+## 6.80 Frontend allocation failure
+
+还必须在完全 quiescent 后验证 accepted - dispatched - dropped_oldest == 0，覆盖 frontend failure、DropNewest 与 Block shutdown cancellation。错误 Status 的 Diagnostic allocation 再次失败时必须保留 code 并安全返回。
 
 fault injection：
 
 ```text
 message materialization
 
-LogRecord creation
-
-Category intern
-
-SetCategoryLevel
-
-BackendFactory
-
-TextFormatter
+LogRecord construction
 ```
 
-分别验证：
+要求：
 
 ```text
 Logger 不抛异常
 
-Context control API 返回 Status
+frontend_failures++
 
-Config builder 仍允许 config-time exception
+Error/Critical → RawLog
+
+lower level → safe drop
+
+admission ownership if already acquired
+must be safely released
 ```
 
 ---
 
-## 6.52 Multi-Runtime tests
+## 6.81 Dynamic config allocation failure
+
+覆盖：
 
 ```text
-Runtime A:
+SetDefaultLevel
+
+SetCategoryLevel
+
+ClearCategoryLevel
+```
+
+确认：
+
+```text
+bad_alloc caught
+
+ResourceExhausted
+
+strong failure guarantee
+```
+
+---
+
+## 6.82 Multi-Runtime
+
+Runtime A：
+
+```text
 Debug
 file A
+```
 
-Runtime B:
+Runtime B：
+
+```text
 Error
 file B
 ```
@@ -7668,76 +9139,89 @@ file B
 验证：
 
 ```text
-A category update
-不影响 B
+A category update 不影响 B
 
-A Backend failure
-不影响 B
+A Backend failure 不影响 B
 
-A Shutdown
-不影响 B
+A Shutdown 不影响 B
 
-A spdlog teardown
-不影响 B
+A spdlog teardown 不影响 B
 ```
 
 ---
 
-## 6.53 Runtime integration tests
+## 6.83 Middleware logger lifecycle
 
-必须验证：
+Middleware Initialize：
+
+```text
+获取 Logger
+```
+
+Middleware Shutdown：
+
+```text
+不再 GetLogger
+
+复用 existing Logger
+```
+
+验证 shutdown 阶段日志正常进入 pipeline。
+
+---
+
+## 6.84 Runtime integration
+
+验证：
 
 ```text
 Logging 先于 Middleware 初始化
 
-Middleware 获得 Logger
+Executor 初始化可记录日志
 
-Middleware shutdown 日志正常
+Middleware shutdown 可记录日志
 
-Executor shutdown 日志正常
+Executor shutdown 可记录日志
 
-Logging 最后 shutdown
+Logging 最后关闭
 
-Logging timeout
+Logging Timeout
 → Runtime Stop Timeout
 
 late Logger
-→ safe no-op
+→ no Backend access
+
+user callable throws with Sync blocked Backend / Async Block full queue
+→ fail-fast path skips normal Logger and reaches terminate
+
+emergency writer may block
+→ fail-fast skips it; test in isolated subprocess
 ```
 
 ---
 
-## 6.54 queue_high_watermark tests
+## 6.85 queue_high_watermark
 
-不要求严格精确。
+压力测试使 queue 明显达到高占用。
 
-压力测试使 queue 明显达到：
-
-```text
->= 500
-```
-
-最终 high-watermark：
+要求：
 
 ```text
-应反映明显高负载
+最终 high-watermark
+反映实际发生过的明显高负载
 ```
 
-不能长期仍然：
+不要求：
 
 ```text
-10
+精确等于瞬时最大 queue size
 ```
 
-但不要求：
-
-```text
-精确 == 503
-```
+sampling algorithm 不作为测试 API。
 
 ---
 
-## 6.55 Benchmark
+## 6.86 Benchmarks
 
 至少：
 
@@ -7747,6 +9231,14 @@ BM_Logger_Enabled_Disabled
 BM_Logger_Enabled_Enabled
 
 BM_CompileTimeDisabled
+
+BM_Logger_Copy
+
+BM_Log_Direct_DisabledByLevel
+
+BM_Log_AfterStop_AdmissionReject
+
+BM_LogLazy_Disabled
 
 BM_Log_Sync
 
@@ -7773,31 +9265,37 @@ BM_Flush_Sync
 
 ---
 
-## 6.56 V1 性能契约
+## 6.87 V1 性能契约
 
 正式冻结：
 
 ```text
-Compile-time disabled macro:
-  logger expression 不求值
-  message expression 不求值
+Compile-time disabled:
+  logger expression 不执行
+  message expression 不执行
 
 Runtime disabled:
-  builder 不执行
+  LogLazy builder 不执行
 
 Logger::Enabled:
   O(1)
   no allocation
   no Backend I/O
   no ordinary mutex
+  two scalar atomic reads acceptable
 
 Logger copy:
   O(1)
   no heap allocation
 
-Async enabled path:
-  caller-side allocation allowed
-  no Sink/output I/O in caller
+Direct Log:
+  Running 时 effective-level check，非 Running 时到 admission reject
+  lifecycle correctness at admission
+
+Async enabled:
+  caller-side message allocation allowed
+  no normal Backend output I/O in caller
+  emergency RawLog may write stderr in caller
 
 AsyncQueue:
   bounded storage
@@ -7808,73 +9306,55 @@ Backend:
 
 ---
 
-## 6.57 不冻结的性能实现
+## 6.88 Internal implementation choices — OPEN
 
-不冻结：
+以下明确不是 Public API contract：
 
 ```text
-具体 ns latency
+Logger state reference:
+  shared_ptr
+  intrusive refcount
+  stable slot
 
-mutex vs lock-free queue
+LogRecord message representation:
+  std::string
+  future SBO
 
-shared_ptr vs intrusive refcount
+Admission implementation:
+  lifecycle + in-flight counter
+  gate mutex
+  combined atomic state word
 
-CategoryEntry container
+AsyncQueue:
+  mutex ring
+  lock-free replacement
 
-queue memory layout
+Flush internal algorithm:
+  control barrier
+  sequence/frontier
+  completion bitmap
 
-control-thread implementation
+Control execution:
+  persistent worker
+  lazy worker
+  per-operation thread
 
-exact throughput
+Category registry container
+
+Category effective-level storage width
+
+BackendStats atomic implementation
+
+queue_high_watermark sampling algorithm
+
+RawLog exact EINTR retry count
 ```
 
-这些通过 benchmark 决定。
+这些实现可以在不修改 V1 semantic contract 的情况下优化。
 
 ---
 
-## 6.58 不宣称 hard-real-time safe
-
-V1 Logging 可能：
-
-```text
-构造 std::string
-
-heap allocation
-
-queue mutex
-
-atomic refcount
-
-Block waiting
-
-Sync Backend I/O
-```
-
-因此：
-
-> **RoComm Logging V1 不是 hard-real-time-safe API。**
-
-严格实时路径应该：
-
-```text
-关闭对应 category
-```
-
-或者：
-
-```text
-compile-time strip
-```
-
-未来需要严格实时日志时：
-
-> **单独设计 fixed-size RT event / trace primitive。**
-
-不能继续把普通 Logger 扩张成实时 tracing system。
-
----
-
-## 6.59 V1 明确不做
+## 6.89 V1 明确不做
 
 V1 不实现：
 
@@ -7889,7 +9369,7 @@ JSON logging
 
 network logging sink
 
-Runtime Backend hot swap
+runtime Backend hot swap
 
 arbitrary CategoryFilter callback
 
@@ -7908,78 +9388,114 @@ process-global logger registry
 custom pattern language
 
 implicit NullBackend from empty outputs
+
+Public AdmissionToken / AdmissionLease
 ```
 
 ---
 
-## 6.60 V1 正式冻结的 Semantic Contract
+## 6.90 V1 冻结契约总表
 
-以下正式冻结：
+以下均正式冻结：
 
 ```text
-Logging Runtime-local ownership
+Runtime-local Logging
 
-四层职责：
-Logger
-LoggingContext
-LoggingBackend
-RawLog
+Logger / LoggingContext / LoggingBackend / RawLog 四层职责
+
+AsyncQueue 属于 LoggingContext
+
+LoggingBackend 是唯一 Public Backend SPI
 
 LogLevel
 
 Critical != Fatal
 
-SourceLocation static-lifetime model
+SourceLocation static-storage model
+
+ROCOMM_SOURCE_LOCATION explicit line cast
 
 LogRecord move-only logical model
 
-message ownership
+LogRecord owns message
 
-category interned lifetime
-
-caller metadata capture
+Category storage follows LoggingState lifetime
 
 Logger default-disabled semantics
 
-Logger O(1) no-allocation copy
+Logger copy O(1), no heap
 
 Logger::Enabled O(1)
 
-lifecycle atomic + effective-level atomic model
+Enabled contains lifecycle + level advisory check
 
-Log()
+Enabled is advisory, not authoritative admission
 
-LogLazy()
+Direct Log does not use Enabled as lifecycle gate
 
-recursion check before Enabled
+Direct Log checks effective level while Running; stopped submission reaches admission
 
-Builder supported return types
+Lifecycle correctness belongs to LoggingContext admission
 
-logging macros
+Admission and Running→Stopping are linearizable
 
-compile-time level mapping
+Admission internal implementation remains private
 
-compile-time filtering
+Log / LogLazy
+
+LogLazy decay-based Builder traits
+
+string literal supported
+
+std::string move materialization
+
+null const char* safe failure
+
+Builder exception containment
+
+Backend recursion check before Enabled
+
+BackendInvocationGuard
+
+RawFallbackGuard
+
+Compile-time logging macros
+
+Compile-time level mapping
 
 Category grammar
 
 Category case-sensitive
 
-reserved rocomm.* namespace
+rocomm.* reserved
 
-longest dot-segment prefix
+dot-segment hierarchy
 
 GetLogger → Result<Logger>
 
 invalid category → InvalidArgument
 
-CategoryLevels synchronization belongs to LoggingContext
+disabled Context GetLogger → disabled Logger
 
-dynamic category update
+CategoryLevels synchronization owned by LoggingContext
 
-strong update failure guarantee
+Dynamic category update
 
-two-layer filtering
+Dynamic update noexcept + ResourceExhausted
+
+Dynamic update strong failure guarantee
+
+Runtime duplicate SetCategoryLevel → last-write-wins
+
+LoggingConfig different category overrides accumulate
+
+LoggingConfig same category → last-write-wins
+
+Config and Runtime SetCategoryLevel duplicate semantics一致
+
+LoggingConfig move noexcept + public and actual storage move verification
+
+Two-layer filtering
 
 LoggingMode
 
@@ -7989,142 +9505,217 @@ DropOldest
 
 Block
 
-severity RawLog fallback without changing overflow policy
+Error/Critical RawLog overflow fallback
 
-queue capacity >= 1
+Queue capacity >= 1
 
-LoggingConfig builder exception model
+No arbitrary queue upper bound
 
-default Async
+Huge queue allocation failure → ResourceExhausted
 
-default DropNewest
+LoggingConfig normal builder exception semantics
 
-default flush-on-level Error
+SetBackendFactory by value + strong exception guarantee
 
-TextBackend common configuration
+Default Async
 
-empty outputs → InvalidArgument
+Default DropNewest
 
-AsyncQueue belongs to LoggingContext
+Default flush-on-level Error
 
-bounded MPSC / single-consumer semantics
+TextBackendConfig
+
+Empty outputs → InvalidArgument
+
+AsyncQueue bounded MPSC/single-consumer semantics
+
+Control signaling not limited by normal queue capacity
 
 Backend invocation serialized
 
-Sync Write caller-thread execution
+Sync Write caller-thread semantics
 
-Sync control operation timeout-safe execution
-
-BackendInvocationGuard on actual Backend thread
+Slow Sync Backend blocks concurrent Sync callers
 
 Flush prefix barrier
 
-barrier is non-droppable
+Flush control is non-droppable
 
-Flush timeout semantics
+Flush timeout includes all waiting phases
 
-Shutdown admission linearization
+Sync Flush/Shutdown timeout-safe control execution
+
+Control execution implementation remains open
+
+Control execution resource failure mapping
+
+Running→Stopping shutdown admission cut
+
+Shutdown preserves configured CategoryEntry levels
+
+direct Log after stop reaches admission reject
+
+LogLazy that sees Stopping before builder
+does not increment rejected_after_stop
+
+LogLazy that wins Enabled but loses admission race
+after a successful builder result increments rejected_after_stop
+
+rejected_after_stop counts lifecycle rejection at admission
 
 logical Stopped vs shutdown completion
 
-Repeated Shutdown joins same completion
+Repeated Shutdown joins same completion and preserves final Status
 
-Shutdown timeout deferred destruction
+Each Shutdown call has its own timeout starting at that call
 
-Custom Backend non-infinite-blocking contract
+Timeout deferred destruction
 
-LoggingStats semantics
+LoggingContext destructor never performs unbounded wait
 
-eventually consistent high-watermark
+Moved-from LoggingContext:
+  Shutdown Ok
+  stateful control API InvalidState
+  GetStats zero snapshot
 
-LoggingBackend is sole Public Backend SPI
+Moved-from result differences have explicit operation-class rationale
 
-BackendFactory per-context ownership
+Custom Backend must not infinitely block
 
-Factory failure propagation
+LoggingStats dispatched means Write returned
+
+Admission ownership is distinct from accepted record transfer accounting
+
+Frontend failure and Block shutdown cancellation advance prefix completion
+
+Shutdown completion stores immutable final Status
+
+Shutdown initiation requires no new allocation or thread creation after Create
+
+Pending Flush is ordered before or merged into Shutdown
+
+Fail-fast never waits on normal Logger or potentially blocking RawLog
+
+Config-disabled Logger remains no-op after level updates and stop
+
+Stats eventually consistent
+
+queue_high_watermark approximate / non-configurable
+
+BackendFactory in logging_backend.hpp
+
+Factory original failure Status propagation
 
 Factory null success → InternalError
 
 Factory exception containment
 
-Backend Initialize() no-argument V1 contract
+Backend Initialize no-argument V1 contract
 
-Backend control APIs noexcept + Status
+Second Initialize → InvalidState, preserving Initialized state
+
+Partial Initialize must be safely shutdown
+
+Backend methods noexcept
+
+Backend GetStats no allocation
+
+BackendStats lock-free implementation is not cross-platform API contract
 
 Backend timeout owned by LoggingContext
 
-TextFormatter full-line semantics
+TextFormatter output semantics
 
-SpdlogBackend global-state isolation
+Local time thread-safe conversion
 
-RawLog requirement
+SpdlogBackend synchronous-only
 
-RawLog EINTR handling
+Spdlog global state forbidden
 
-Runtime closes Logging after Middleware/Executor
+spdlog init_thread_pool forbidden
+
+Spdlog symbol scan
+
+RawLog V1 requirement
+
+RawLog no normal pipeline dependency
+
+RawLog bounded EINTR retry
+
+Middleware acquires Logger during Initialize
+
+Middleware Shutdown reuses existing Logger
+
+Logging remains Running through Middleware/Executor shutdown
 
 V2 NativeBackend reuses V1 runtime
 
-V2 native-specific config cannot mutate V1 Text contract
+V1 TextBackendConfig remains frozen as common text semantics
+
+V2 Native-specific config does not mutate V1 Text contract
+
+Future deferred formatting adds new primitive instead of changing V1 LogRecord
 ```
 
 ---
 
-## 6.61 仍属于 Header/API Finalization 的事项
+## 6.91 V1 Implementation Baseline
 
-经过本轮收敛后，剩余问题已经不再涉及架构方向，主要是 exact C++ 形状：
-
-```text
-1. RoComm 公共 Duration 的最终类型名和 header。
-
-2. LoggingBackendFactory 的最终 typedef 所在 header。
-
-3. LoggingConfig::SetBackendFactory
-   是按值接收还是 rvalue reference 接收。
-
-4. LoggingConfig move/copy exact noexcept contract。
-
-5. LoggingContext move assignment
-   对目标已有 state 的 release-before-acquire exact 行为。
-
-6. LogRecord 内部 message storage
-   是 std::string 还是 small-buffer representation。
-
-7. CategoryEntry internal reference
-   使用 shared_ptr / intrusive / stable registry slot 的具体方案。
-
-8. LogLazy traits/static_assert 的 exact diagnostic 文本。
-
-9. Flush barrier 的具体内部实现：
-   control record
-   还是 sequence/frontier。
-
-10. Sync control operation
-    使用临时 self-owned thread
-    还是持久 control worker。
-
-11. LoggingStats counter 的 exact atomic width/storage。
-
-12. Backend contract test helper 的具体测试框架接口。
-```
-
-这些属于：
-
-> **Header / implementation finalization。**
-
-不再重新打开：
+本文件完成后，以下内容不再属于设计开放问题：
 
 ```text
 模块职责
-AsyncQueue 归属
-Backend SPI 边界
-Flush/Shutdown 语义
-Runtime-local ownership
+
+Public API semantic model
+
+Category model
+
+LoggingConfig model
+
+LoggingContext lifecycle
+
+Admission semantics
+
+Enabled / Log / LogLazy responsibility boundary
+
+Queue ownership
+
+Overflow semantics
+
+Flush semantics
+
+Shutdown semantics
+
+Timeout model
+
+rejected_after_stop semantics
+
+Backend SPI
+
+SpdlogBackend boundary
+
+RawLog boundary
+
+Runtime integration
+
+V2 evolution boundary
+```
+
+后续实现阶段若发现某项无法实现，不应直接在代码中自行改变语义。
+
+必须：
+
+```text
+明确指出冲突
+
+重新进行对应设计评审
+
+再修改本文契约
 ```
 
 ---
 
-## 6.62 最终架构图
+## 6.92 最终架构
 
 ```text
                      RoComm / Application
@@ -8139,10 +9730,10 @@ Runtime-local ownership
                                        CategoryEntry
                                              │
                                              ▼
-                                    message construction
+                                    Admission Boundary
                                              │
                                              ▼
-                                         LogRecord
+                                owned message / LogRecord
                                              │
                                              ▼
                                       LoggingContext
@@ -8150,13 +9741,13 @@ Runtime-local ownership
                               │                             │
                              Sync                          Async
                               │                             │
-                       backend mutex                   AsyncQueue
+                       backend serialization            AsyncQueue
                               │                             │
                               │                         writer
                               │                             │
                               └──────────────┬──────────────┘
                                              │
-                                    BackendInvocationGuard
+                                  BackendInvocationGuard
                                              │
                                              ▼
                                       LoggingBackend
@@ -8167,34 +9758,65 @@ Runtime-local ownership
                                 V1            V2
 ```
 
-Control path：
+Lifecycle / admission：
+
+```text
+Enabled()
+   │
+   ├── lifecycle advisory check
+   └── effective-level advisory check
+              │
+              ▼
+        builder() for LogLazy
+              │
+              ▼
+     Log / internal submission
+              │
+  effective-level check if Running
+              │
+              ▼
+       Admission Boundary
+              │
+      ┌───────┴────────┐
+      │                │
+   Running         Stopping/Stopped
+      │                │
+   accept            reject
+      │                │
+      │       rejected_after_stop++
+      ▼
+ owned message / LogRecord
+      │
+      ▼
+ sync/async ownership transfer
+```
+
+Control plane：
 
 ```text
 Flush / Shutdown
        │
        ▼
-LoggingContext control operation
+LoggingContext control state
        │
-       ├── Async mode
-       │      ↓
-       │   writer/control path
+       ▼
+self-owned control execution
        │
-       └── Sync mode
-              ↓
-       self-owned control execution
-              ↓
-      backend serialization
-              ↓
-      Flush / Shutdown
+       ▼
+Backend serialization
+       │
+       ▼
+Backend Flush / Shutdown
 ```
 
-Emergency path：
+Emergency：
 
 ```text
 Backend recursion
 logging unavailable
 allocation failure
-fatal invariant
+Backend failure
+ordinary invariant diagnostic
 late teardown
        │
        ▼
@@ -8206,88 +9828,122 @@ low-level stderr
 
 ---
 
-## 6.63 最终设计结论
+## 6.93 最终设计结论
 
 RoComm Logging V1 正式采用：
 
-> **RoComm-owned Logger frontend + Runtime-local LoggingContext + unified bounded dispatch + narrow LoggingBackend SPI + SpdlogBackend。**
+> **RoComm-owned Logger frontend + Runtime-local LoggingContext + explicit admission boundary + unified bounded dispatch + narrow LoggingBackend SPI + SpdlogBackend。**
 
 其中：
 
-> **Logger 只负责 Category、Enabled、message admission 和 SourceLocation。**
+> **Logger 负责 Category、Enabled、SourceLocation、message construction 前的快速过滤以及日志提交入口。**
 
-> **LoggingContext 统一负责 lifecycle、Category policy、sync/async dispatch、queue、overflow、Backend serialization、Flush、Shutdown、timeout 和 statistics。**
+> **`Logger::Enabled()` 是 advisory fast path，不是 lifecycle correctness boundary。它包含 lifecycle 和 effective-level 检查，以避免不必要的 builder/message construction。**
+
+> **Direct Log 不把 Enabled 当作 lifecycle gate；Running 时检查 effective level，观察非 Running 时交给 admission 拒绝。Admission 后才构造 owned record，LogLazy builder 仍在 admission 前执行。**
+
+> **Logging admission 与 `Running → Stopping` 必须线性化。Log 先赢则 Shutdown 必须承担该 operation；Shutdown 先赢则 admission 必须拒绝。**
+
+> **不向 Public API 暴露 AdmissionToken/AdmissionLease；admission gate 的 atomic/count/mutex representation 完全属于内部实现。**
+
+> **`rejected_after_stop` 统计真正到达 admission boundary、但因 lifecycle 已非 Running 而被拒绝的 logging operation。**
+
+> **有效且 config-enabled Logger 在停止后以合法 severity direct Log，跳过 level filtering，在 admission 被拒绝并增加 rejected_after_stop；默认 / disabled Logger 始终 no-op。**
+
+> **如果 LogLazy/宏一开始就通过 `Enabled()` 观察到 Stopping/Stopped，它不会执行 builder，也不会增加 `rejected_after_stop`。**
+
+> **LogLazy 先通过 Enabled、builder 正常返回，随后输掉 admission race 时，rejected_after_stop 增加；builder failure 或 admission 前 filtering 不计 rejection。**
+
+> **LoggingContext 统一负责 lifecycle、Admission、Category policy、sync/async dispatch、Queue、Overflow、Backend serialization、Flush、Shutdown、Timeout 与 Statistics。**
 
 > **AsyncQueue 不属于 SpdlogBackend，也不属于未来 NativeBackend。**
 
 > **LoggingBackend 是唯一 Public Backend extension point；V1 不建立第二套 Public Sink SPI。**
 
-> **Backend invocation 在 LoggingContext 层串行化，因此 Custom Backend 不需要自行支持并发 Write。**
+> **Backend invocation 在 LoggingContext 层串行化，所以 Custom Backend 不需要自行实现并发 Write。**
 
-> **Sync mode 的普通 Write 在 caller thread 执行，Backend 阻塞会传播到 call site；它不是 hot-path optimization mode。**
+> **Synchronous normal Write 在 caller thread 执行；一个慢 Backend 会通过 serialization 阻塞其他并发 Sync caller。**
 
-> **带 timeout 的 Flush/Shutdown control operation 即使在 Sync mode 下，也不能直接把可能无限阻塞的 Backend control call 放在用户 caller thread 上执行，而应使用 self-owned control execution，使 timeout contract 可兑现。**
+> **带 timeout 的 Flush/Shutdown control operation 不允许直接让用户 caller thread 被不可控 Backend call 永久阻塞；必须通过 self-owned control execution 提供 timeout。具体 control thread 策略仍属于实现选择。**
 
-> **Recursion guard 在真实 Backend invocation thread 设置。Async 模式下是 writer/control thread，Sync 模式下是 caller/control thread。**
+> **Recursion guard 在真正调用 Backend 的线程设置；Backend Initialize/Write/Flush/Shutdown 内部再次使用 Logger 都进入 RawLog fallback。**
 
-> **Logger 在 recursion path 中先检查 guard，再检查普通 Enabled；Backend Initialize/Flush/Shutdown 内产生的日志因此会进入 RawLog，而不会因为 Runtime state 暂时不可用被静默吞掉。**
+> **默认、moved-from、config-disabled Logger 始终 no-op，包括递归场景；不可变 disabled gate 不会被动态 level 更新重新开启。**
 
-> **Flush 使用与 log admission 线性化的不可丢弃 prefix barrier，不依赖简单 accepted/dispatched counter 推断完成状态。**
+> **LogLazy 使用 decay 后的 Builder 返回类型判断，因此字符串字面量合法；`std::string` 返回值允许直接 move 到 LogRecord。**
 
-> **Shutdown 的 correctness 由原子 Running→Stopping admission cut 保证；批量将 CategoryEntry 设置为 Off 只是优化。**
+> **Flush 使用与 admission 线性化的不可丢弃 prefix boundary；不依赖简单 accepted/dispatched 计数推断完成状态，也不冻结具体内部 barrier 算法。**
 
-> **Logical Stopped 与 shutdown quiescence 分离。第一次 Shutdown Timeout 后，再次 Shutdown 必须继续等待同一个 shutdown completion，而不是仅因 lifecycle 已 Stopped 就无条件返回 Ok。**
+> **Shutdown 的正确性由 Running→Stopping admission cut 保证，不覆盖 CategoryEntry effective level；已提交 category 配置与 lifecycle 分开表达。**
 
-> **Shutdown timeout 后 Backend 和 worker backing 可以延迟析构；RoComm 不通过 unsafe thread termination 回收永久阻塞的 Custom Backend。**
+> **Logical Stopped、shutdown completion 和 final Status 分离。重复调用等待同一 completion，使用自身 timeout；Complete 后返回保存的最终结果，不掩盖 Backend control failure。**
 
-> **DropNewest 和 DropOldest 都严格保持自身 overflow 语义；Error/Critical 只额外触发 RawLog fallback，不改变究竟丢弃哪条记录。**
+> **LoggingContext wrapper 析构不执行可能无限阻塞的 cleanup；必要 backing 通过 self-owned LoggingState 延迟释放。**
 
-> **BackendFactory 是 control-plane exception boundary；failure Result 原样传播，success+nullptr 为 InternalError，bad_alloc 映射 ResourceExhausted，其余异常映射 InternalError。**
+> **DropNewest 和 DropOldest 都严格保持各自 Overflow 语义；Error/Critical 只增加 RawLog emergency fallback，不改变究竟丢哪条 record。**
 
-> **LoggingConfig 是普通 configuration builder，允许配置期 allocation exception；已经创建的 LoggingContext control API 则通过 Status 表达资源失败并保证失败时不留下半更新配置。**
+> **LoggingConfig 的 Category override 采用集合式累积语义：不同 category 累积，同一 category 重复设置 last-write-wins。Runtime 动态 SetCategoryLevel 使用相同的重复设置语义。**
 
-> **GetLogger 正式返回 `Result<Logger>`；invalid category 返回 InvalidArgument；默认构造 Logger 永远是安全 disabled handle。**
+> **LoggingConfig 是普通 builder；配置期 allocation exception 可以抛出。已经创建的 LoggingContext control API 则通过 Status 表达失败并提供明确的失败保证。**
 
-> **Category 是 case-sensitive 的 dot hierarchy；CategoryLevels 自身不负责线程安全，统一由 LoggingContext 同步。**
+> **LoggingConfig move 是 noexcept contract；公共 traits 只验证声明，还必须验证实际 storage / 成员的移动安全并审查自定义 move body。**
 
-> **Category intern storage 属于 self-owned Logging State，其生命周期必须覆盖 shutdown timeout 后的所有 in-flight LogRecord。**
+> **Dynamic Category update 的所有可失败工作发生在 commit 前；commit 后 effective-level propagation 不再存在 failure path。**
 
-> **Logger copy 必须 O(1) 且不分配内存，但 V1 不冻结 shared_ptr 等具体引用机制。**
+> **GetLogger 正式返回 `Result<Logger>`；invalid category 返回 InvalidArgument；默认构造 Logger 是安全 disabled handle；moved-from LoggingContext 使用 InvalidState，而 RuntimeStopped 只表示有效 state 已经停止。**
 
-> **`queue_high_watermark` 是 eventually-consistent diagnostic statistic，不为了绝对精确在每次 producer Push 上付出高成本 atomic-max。**
+> **Moved-from Context 中，Shutdown 返回 Ok 是因为它属于安全幂等 release operation；Flush/GetLogger/Set* 返回 InvalidState 是因为它们需要有效 state；GetStats 返回零快照是为了让诊断路径可以无条件读取。**
 
-> **SpdlogBackend 必须隔离 spdlog process-global registry、global level、global shutdown 和 global async runtime，并通过运行时测试和符号扫描防止架构回退。**
+> **Category intern storage 属于 self-owned LoggingState，其生命周期覆盖 wrapper、Logger 已销毁但 worker 仍在处理 in-flight LogRecord 的情况。**
 
-> **`TextBackendConfig.outputs.empty()` 是 InvalidArgument，不隐式转换为 NullBackend。**
+> **`LoggingStats::dispatched` 表示 `Backend::Write()` 已经返回，而不是刚开始调用。**
 
-> **Runtime shutdown 时 Logging 最后关闭；Middleware 和 Executor shutdown 阶段仍使用完整正常 Logging pipeline。**
+> **BackendStats 内部通常可以使用 atomic uint64，但 atomic 是否 lock-free 不作为跨平台 Public contract。**
 
-> **V2 NativeBackend 必须适配 V1 已冻结的 TextBackend contract；Native-specific 能力使用独立配置，不反向污染 V1 公共结构。**
+> **`queue_high_watermark` 是 eventually-consistent diagnostic statistic，采样算法不属于 API，也不向用户暴露采样周期。**
+
+> **SpdlogBackend 与 spdlog process-global registry、global level、global shutdown、global async pool、`init_thread_pool()` 完全隔离，并通过 runtime tests 与 symbol scan 防止架构回退。**
+
+> **RawLog 使用固定大小低层输出路径，POSIX EINTR retry 必须有界，但 exact retry count 仍属于实现常量。**
+
+> **普通 RawLog 的单次 OS write 可能阻塞；fail-fast 不调用普通 Logger 或可能阻塞的 RawLog，只可选尝试已证明 nonblocking 的 emergency diagnostic。**
+
+> **Middleware 必须在 Initialize 阶段取得长期需要的 Logger；shutdown 阶段复用已有 Logger。正常 shutdown 在 Middleware/Executor cleanup 后关闭 Logging；Runtime deadline 耗尽时也必须发起 Logging shutdown，允许未完成工作安全延迟清理。**
+
+> **V1 `TextBackendConfig` 已经冻结为 Backend-neutral 的公共文本输出契约，不再为了假想 V2 能力重新开放；Native-specific 能力进入独立 NativeBackendConfig。**
+
+> **V2 NativeBackend 适配 V1 已冻结的 TextBackend contract，而不是反向修改 V1 contract。**
+
+> **未来如果需要 Quill 风格 deferred formatting，应增加新的 record/frontend primitive，而不是改变 V1 LogRecord 的 owned-message 语义。**
 
 > **Logging failure 永远不能修改 Topic / Service operation 的通信 Status。**
 
-> **V1 Logging 不宣称 hard-real-time safe；严格实时事件记录如果未来需要，应单独设计 fixed-size RT event / trace primitive。**
+> **V1 Logging 不宣称 hard-real-time safe。严格实时事件记录属于未来独立 RT event/trace primitive。**
 
-本文档可以作为：
+本文档自此可作为：
 
 ```text
 docs/logging.md
 
-RoComm Logging V1 Design Baseline
+RoComm Logging V1 Implementation Baseline
 ```
 
-进入下一阶段：
+进入实现阶段：
 
 ```text
-Public Header / API Finalization
-        ↓
-Backend-independent Logging Core
-        ↓
+Public Headers
+      ↓
+Backend-independent Core
+      ↓
+Admission / Shutdown Linearization Validation
+      ↓
 TestBackend Contract Validation
-        ↓
+      ↓
 SpdlogBackend
-        ↓
+      ↓
 Runtime Integration
-        ↓
-Concurrency / Performance Verification
+      ↓
+Concurrency / Sanitizer / Performance Verification
 ```
+
+除非实现阶段发现明确不可满足的契约冲突，否则不再重新打开 Logging V1 总体架构。
