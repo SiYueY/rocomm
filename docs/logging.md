@@ -7111,6 +7111,14 @@ ROCOMM_BUILD_LOGGING_SPDLOG
 ROCOMM_LOGGING_COMPILED_LEVEL
 ```
 
+启用 `ROCOMM_BUILD_LOGGING_SPDLOG` 时，CMake 只使用固定在
+`third_party/spdlog` 的 Git submodule，不依赖或静默探测系统安装包。首次 clone
+仓库后必须执行：
+
+```bash
+git submodule update --init --recursive
+```
+
 feature：
 
 ```text
