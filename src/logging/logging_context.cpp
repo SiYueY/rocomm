@@ -71,7 +71,6 @@ void emit_frontend_fallback(LogLevel level, std::string_view message) noexcept {
 
 void emit_recursive_fallback(std::string_view message) noexcept {
     if (raw_fallback_active) {
-        raw_log(message);
         return;
     }
     RawFallbackGuard guard;
@@ -119,8 +118,11 @@ LogLevel Logger::State::resolve_level(std::string_view category) const noexcept 
 }
 
 std::uint64_t Logger::State::begin_admission() noexcept {
-    std::lock_guard<std::mutex> lock(mutex);
-    if (lifecycle != LoggingLifecycle::Running) {
+    std::lock_guard<std::timed_mutex> lock(mutex);
+    // A successful observation of the open admission gate while holding
+    // this mutex is the admission linearization point. The token/pending
+    // insertion is completed before releasing the mutex.
+    if (lifecycle != LoggingLifecycle::Running || shutdown_signal.load(std::memory_order_acquire)) {
         rejected_after_stop.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
@@ -136,7 +138,7 @@ std::uint64_t Logger::State::begin_admission() noexcept {
 
 void Logger::State::terminalize(std::uint64_t token) noexcept {
     {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::lock_guard<std::timed_mutex> lock(mutex);
         pending.erase(token);
     }
     completion_cv.notify_all();
@@ -167,10 +169,10 @@ void Logger::State::write_record(LogRecord& record) noexcept {
     }
 }
 
-void Logger::State::execute_backend_flush() noexcept {
+Status Logger::State::execute_backend_flush() noexcept {
     std::lock_guard<std::mutex> backend_lock(backend_mutex);
     BackendInvocationGuard guard;
-    flush_status = backend->flush();
+    return backend->flush();
 }
 
 void Logger::State::execute_backend_shutdown() noexcept {
@@ -182,38 +184,58 @@ void Logger::State::execute_backend_shutdown() noexcept {
         flush_result = backend->flush();
         shutdown_result = backend->shutdown();
     }
-    std::lock_guard<std::mutex> lock(mutex);
-    shutdown_status = !flush_result.ok() ? flush_result : shutdown_result;
-    shutdown_complete = true;
-    lifecycle = LoggingLifecycle::Stopped;
-    lifecycle_fast.store(
-        static_cast<std::uint8_t>(LoggingLifecycle::Stopped), std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(completion_mutex);
+        shutdown_status = !flush_result.ok() ? flush_result : shutdown_result;
+    }
+    {
+        std::lock_guard<std::timed_mutex> lock(mutex);
+        lifecycle = LoggingLifecycle::Stopped;
+        lifecycle_fast.store(
+            static_cast<std::uint8_t>(LoggingLifecycle::Stopped), std::memory_order_release);
+    }
+    completion_cv.notify_all();
+}
+
+void Logger::State::complete_worker_exit() noexcept {
+    {
+        std::lock_guard<std::mutex> lock(completion_mutex);
+        shutdown_complete = true;
+    }
     completion_cv.notify_all();
 }
 
 void Logger::State::worker_loop() noexcept {
     while (true) {
         std::optional<WorkItem> work;
-        bool do_flush = false;
+        std::shared_ptr<FlushRequest> request;
         bool do_shutdown = false;
         {
-            std::unique_lock<std::mutex> lock(mutex);
+            std::unique_lock<std::timed_mutex> lock(mutex);
             work_cv.wait(lock, [this] {
                 return queue_size != 0U ||
-                       (flush_requested && !pending_through_locked(flush_boundary)) ||
-                       (shutdown_requested && pending.empty());
+                       (shutdown_signal.load(std::memory_order_acquire) &&
+                        (!shutdown_requested || pending.empty())) ||
+                       (!flush_requests.empty() &&
+                        !pending_through_locked(flush_requests.front()->boundary));
             });
+            if (shutdown_signal.load(std::memory_order_acquire)) {
+                lifecycle = LoggingLifecycle::Stopping;
+                shutdown_requested = true;
+            }
             if (queue_size != 0U) {
                 work.emplace(std::move(*queue[queue_head]));
                 queue[queue_head].reset();
                 queue_head = (queue_head + 1U) % capacity;
                 --queue_size;
                 work_cv.notify_all();
-            } else if (shutdown_requested && pending.empty()) {
+            } else if (
+                !flush_requests.empty() &&
+                !pending_through_locked(flush_requests.front()->boundary)) {
+                request = std::move(flush_requests.front());
+                flush_requests.pop_front();
+            } else if (shutdown_requested && pending.empty() && flush_requests.empty()) {
                 do_shutdown = true;
-            } else if (flush_requested && !pending_through_locked(flush_boundary)) {
-                do_flush = true;
-                flush_requested = false;
             }
         }
 
@@ -222,11 +244,12 @@ void Logger::State::worker_loop() noexcept {
             terminalize(work->token);
             continue;
         }
-        if (do_flush) {
-            execute_backend_flush();
+        if (request) {
+            const Status status = execute_backend_flush();
             {
-                std::lock_guard<std::mutex> lock(mutex);
-                flushed_boundary = flush_boundary;
+                std::lock_guard<std::mutex> lock(completion_mutex);
+                request->status = status;
+                request->complete = true;
             }
             completion_cv.notify_all();
             continue;
@@ -310,7 +333,10 @@ void Logger::log(LogLevel level, std::string_view message, SourceLocation source
         LoggingLifecycle::Running) {
         const LogLevel threshold =
             static_cast<LogLevel>(category_->effective_level.load(std::memory_order_relaxed));
-        if (!is_enabled(level, threshold)) {
+        if (!is_enabled(level, threshold) &&
+            !state_->shutdown_signal.load(std::memory_order_acquire) &&
+            static_cast<LoggingLifecycle>(state_->lifecycle_fast.load(std::memory_order_acquire)) ==
+                LoggingLifecycle::Running) {
             return;
         }
     }
@@ -343,7 +369,10 @@ void Logger::log_owned(LogLevel level, std::string message, SourceLocation sourc
         LoggingLifecycle::Running) {
         const LogLevel threshold =
             static_cast<LogLevel>(category_->effective_level.load(std::memory_order_relaxed));
-        if (!is_enabled(level, threshold)) {
+        if (!is_enabled(level, threshold) &&
+            !state_->shutdown_signal.load(std::memory_order_acquire) &&
+            static_cast<LoggingLifecycle>(state_->lifecycle_fast.load(std::memory_order_acquire)) ==
+                LoggingLifecycle::Running) {
             return;
         }
     }
@@ -375,7 +404,7 @@ void Logger::submit_admitted(
         }
         bool dropped_oldest = false;
         LogLevel dropped_level = LogLevel::Trace;
-        std::unique_lock<std::mutex> lock(state_->mutex);
+        std::unique_lock<std::timed_mutex> lock(state_->mutex);
         if (state_->overflow_policy == LogOverflowPolicy::Block) {
             state_->work_cv.wait(lock, [this] {
                 return state_->queue_size < state_->capacity ||
@@ -436,6 +465,10 @@ LoggingContext::~LoggingContext() noexcept { (void)shutdown(Duration::zero()); }
 
 Result<LoggingContext> LoggingContext::create(LoggingConfig config) {
     if (!is_threshold_level(config.default_level_) || !is_threshold_level(config.flush_on_level_) ||
+        (config.mode_ != LoggingMode::Asynchronous && config.mode_ != LoggingMode::Synchronous) ||
+        (config.overflow_policy_ != LogOverflowPolicy::DropNewest &&
+         config.overflow_policy_ != LogOverflowPolicy::DropOldest &&
+         config.overflow_policy_ != LogOverflowPolicy::Block) ||
         (config.mode_ == LoggingMode::Asynchronous && config.queue_capacity_ == 0U)) {
         return Status(StatusCode::InvalidArgument);
     }
@@ -507,7 +540,19 @@ Result<LoggingContext> LoggingContext::create(LoggingConfig config) {
             }
         }
         try {
-            std::thread([state] { state->worker_loop(); }).detach();
+            std::thread worker([state] {
+                state->worker_loop();
+                state->complete_worker_exit();
+            });
+            try {
+                worker.detach();
+            } catch (...) {
+                // A failed detach must not destroy a joinable std::thread.
+                state->shutdown_signal.store(true, std::memory_order_release);
+                state->work_cv.notify_all();
+                worker.join();
+                return Status(StatusCode::InternalError);
+            }
         } catch (const std::system_error&) {
             std::lock_guard<std::mutex> backend_lock(state->backend_mutex);
             BackendInvocationGuard guard;
@@ -530,8 +575,9 @@ Result<Logger> LoggingContext::get_logger(std::string_view category) {
         return Status(StatusCode::InvalidArgument);
     }
     try {
-        std::lock_guard<std::mutex> lock(state_->mutex);
-        if (state_->lifecycle != LoggingLifecycle::Running) {
+        std::lock_guard<std::timed_mutex> lock(state_->mutex);
+        if (state_->lifecycle != LoggingLifecycle::Running ||
+            state_->shutdown_signal.load(std::memory_order_acquire)) {
             return Status(StatusCode::RuntimeStopped);
         }
         const auto found = state_->categories.find(std::string(category));
@@ -556,7 +602,7 @@ Status LoggingContext::set_default_level(LogLevel level) noexcept {
     if (!is_threshold_level(level)) {
         return Status(StatusCode::InvalidArgument);
     }
-    std::lock_guard<std::mutex> lock(state_->mutex);
+    std::lock_guard<std::timed_mutex> lock(state_->mutex);
     if (state_->lifecycle != LoggingLifecycle::Running) {
         return Status(StatusCode::RuntimeStopped);
     }
@@ -577,8 +623,9 @@ Status LoggingContext::set_category_level(std::string_view category, LogLevel le
         return Status(StatusCode::InvalidArgument);
     }
     try {
-        std::lock_guard<std::mutex> lock(state_->mutex);
-        if (state_->lifecycle != LoggingLifecycle::Running) {
+        std::lock_guard<std::timed_mutex> lock(state_->mutex);
+        if (state_->lifecycle != LoggingLifecycle::Running ||
+            state_->shutdown_signal.load(std::memory_order_acquire)) {
             return Status(StatusCode::RuntimeStopped);
         }
         auto updated = state_->overrides;
@@ -605,8 +652,9 @@ Status LoggingContext::clear_category_level(std::string_view category) noexcept 
         return Status(StatusCode::InvalidArgument);
     }
     try {
-        std::lock_guard<std::mutex> lock(state_->mutex);
-        if (state_->lifecycle != LoggingLifecycle::Running) {
+        std::lock_guard<std::timed_mutex> lock(state_->mutex);
+        if (state_->lifecycle != LoggingLifecycle::Running ||
+            state_->shutdown_signal.load(std::memory_order_acquire)) {
             return Status(StatusCode::RuntimeStopped);
         }
         auto updated = state_->overrides;
@@ -635,28 +683,46 @@ Status LoggingContext::flush(Duration timeout) noexcept {
     if (timeout.count() < 0) {
         return Status(StatusCode::InvalidArgument);
     }
-    std::unique_lock<std::mutex> lock(state_->mutex);
-    if (state_->lifecycle != LoggingLifecycle::Running) {
-        const auto deadline = deadline_from(timeout);
-        if (!state_->completion_cv.wait_until(
-                lock, deadline, [this] { return state_->shutdown_complete; })) {
-            return Status(StatusCode::Timeout);
-        }
-        return state_->shutdown_status;
-    }
-    const std::uint64_t boundary = state_->next_token - 1;
-    state_->flush_requested = true;
-    state_->flush_boundary = std::max(state_->flush_boundary, boundary);
-    lock.unlock();
-    state_->work_cv.notify_all();
-    lock.lock();
     const auto deadline = deadline_from(timeout);
-    if (!state_->completion_cv.wait_until(lock, deadline, [this, boundary] {
-            return state_->shutdown_complete || state_->flushed_boundary >= boundary;
+    std::shared_ptr<Logger::State::FlushRequest> request;
+    try {
+        request = std::make_shared<Logger::State::FlushRequest>();
+    } catch (const std::bad_alloc&) {
+        return Status(StatusCode::ResourceExhausted);
+    } catch (...) {
+        return Status(StatusCode::InternalError);
+    }
+
+    std::unique_lock<std::timed_mutex> state_lock(state_->mutex, std::defer_lock);
+    if (!state_lock.try_lock_until(deadline)) {
+        return Status(StatusCode::Timeout);
+    }
+    const bool running = state_->lifecycle == LoggingLifecycle::Running &&
+                         !state_->shutdown_signal.load(std::memory_order_acquire);
+    if (running) {
+        try {
+            request->boundary = state_->next_token - 1U;
+            state_->flush_requests.emplace_back(request);
+        } catch (const std::bad_alloc&) {
+            return Status(StatusCode::ResourceExhausted);
+        } catch (...) {
+            return Status(StatusCode::InternalError);
+        }
+    }
+    state_lock.unlock();
+    if (running) {
+        state_->work_cv.notify_all();
+    }
+
+    // Completion has a separate, short-lived lock. Never reacquire the
+    // admission/category mutex after starting the timed wait.
+    std::unique_lock<std::mutex> completion_lock(state_->completion_mutex);
+    if (!state_->completion_cv.wait_until(completion_lock, deadline, [&] {
+            return (running && request->complete) || state_->shutdown_complete;
         })) {
         return Status(StatusCode::Timeout);
     }
-    return state_->shutdown_complete ? state_->shutdown_status : state_->flush_status;
+    return running && request->complete ? request->status : state_->shutdown_status;
 }
 
 Status LoggingContext::shutdown(Duration timeout) noexcept {
@@ -664,30 +730,44 @@ Status LoggingContext::shutdown(Duration timeout) noexcept {
         return Status();
     }
     if (!state_->enabled) {
-        std::lock_guard<std::mutex> lock(state_->mutex);
-        state_->lifecycle = LoggingLifecycle::Stopped;
+        // The disabled context has no worker/backend. No mutex is required
+        // to close its immutable no-op data plane.
+        state_->shutdown_signal.store(true, std::memory_order_release);
         state_->lifecycle_fast.store(
             static_cast<std::uint8_t>(LoggingLifecycle::Stopped), std::memory_order_release);
-        state_->shutdown_complete = true;
+        {
+            std::lock_guard<std::mutex> completion_lock(state_->completion_mutex);
+            state_->shutdown_complete = true;
+        }
+        state_->completion_cv.notify_all();
         return Status();
     }
     if (timeout.count() < 0) {
         return Status(StatusCode::InvalidArgument);
     }
-    std::unique_lock<std::mutex> lock(state_->mutex);
+    const auto deadline = deadline_from(timeout);
+    // Closing admission is independent of the state lock, even for Shutdown(0).
+    state_->shutdown_signal.store(true, std::memory_order_release);
+    std::uint8_t expected = static_cast<std::uint8_t>(LoggingLifecycle::Running);
+    (void)state_->lifecycle_fast.compare_exchange_strong(
+        expected, static_cast<std::uint8_t>(LoggingLifecycle::Stopping), std::memory_order_acq_rel,
+        std::memory_order_acquire);
+    state_->work_cv.notify_all();
+
+    std::unique_lock<std::timed_mutex> state_lock(state_->mutex, std::defer_lock);
+    if (!state_lock.try_lock_until(deadline)) {
+        return Status(StatusCode::Timeout);
+    }
+    state_->shutdown_requested = true;
     if (state_->lifecycle == LoggingLifecycle::Running) {
         state_->lifecycle = LoggingLifecycle::Stopping;
-        state_->lifecycle_fast.store(
-            static_cast<std::uint8_t>(LoggingLifecycle::Stopping), std::memory_order_release);
-        state_->shutdown_requested = true;
-        lock.unlock();
-        state_->work_cv.notify_all();
-        lock.lock();
     }
-    const auto deadline = deadline_from(timeout);
+    state_lock.unlock();
+    state_->work_cv.notify_all();
+
+    std::unique_lock<std::mutex> completion_lock(state_->completion_mutex);
     if (!state_->completion_cv.wait_until(
-            lock, deadline, [this] { return state_->shutdown_complete; })) {
-        state_->lifecycle = LoggingLifecycle::Stopped;
+            completion_lock, deadline, [this] { return state_->shutdown_complete; })) {
         state_->lifecycle_fast.store(
             static_cast<std::uint8_t>(LoggingLifecycle::Stopped), std::memory_order_release);
         return Status(StatusCode::Timeout);

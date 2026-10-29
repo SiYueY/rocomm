@@ -1,4 +1,4 @@
-#include <cassert>
+#include "support/check.hpp"
 #include <chrono>
 #include <condition_variable>
 #include <memory>
@@ -57,23 +57,23 @@ void verify_stop_can_rewait_after_timeout() {
     config.set_logging(std::move(logging_config))
         .set_shutdown_timeout(std::chrono::milliseconds(10));
     auto runtime_result = rocomm::Runtime::create(std::move(config));
-    assert(runtime_result.ok());
+    CHECK(runtime_result.ok());
     auto runtime = std::move(runtime_result).value();
     auto logger_result = runtime.get_logger("rocomm.runtime.timeout");
-    assert(logger_result.ok());
+    CHECK(logger_result.ok());
     auto logger = std::move(logger_result).value();
     logger.log(rocomm::logging::LogLevel::Info, "blocked");
     {
         std::unique_lock<std::mutex> lock(gate->mutex);
         gate->entered_cv.wait(lock, [&] { return gate->entered; });
     }
-    assert(runtime.stop().code() == rocomm::StatusCode::Timeout);
+    CHECK(runtime.stop().code() == rocomm::StatusCode::Timeout);
     {
         std::lock_guard<std::mutex> lock(gate->mutex);
         gate->released = true;
     }
     gate->release_cv.notify_all();
-    assert(runtime.stop().ok());
+    CHECK(runtime.stop().ok());
 }
 
 }  // namespace
@@ -82,7 +82,7 @@ int main() {
     verify_stop_can_rewait_after_timeout();
     rocomm::RuntimeConfig invalid_config;
     invalid_config.set_shutdown_timeout(std::chrono::milliseconds(-1));
-    assert(!rocomm::Runtime::create(std::move(invalid_config)).ok());
+    CHECK(!rocomm::Runtime::create(std::move(invalid_config)).ok());
 
     rocomm::RuntimeConfig config;
     rocomm::logging::LoggingConfig logging_config;
@@ -93,28 +93,28 @@ int main() {
     config.set_logging(std::move(logging_config)).set_shutdown_timeout(std::chrono::seconds(1));
 
     auto runtime_result = rocomm::Runtime::create(std::move(config));
-    assert(runtime_result.ok());
+    CHECK(runtime_result.ok());
     auto runtime = std::move(runtime_result).value();
     auto logger_result = runtime.get_logger("rocomm.runtime");
-    assert(logger_result.ok());
+    CHECK(logger_result.ok());
     auto logger = std::move(logger_result).value();
     int message_evaluations = 0;
     ROCOMM_LOG_INFO(logger, (++message_evaluations, "macro expression"));
-    assert(runtime.stop().ok());
-    assert(!runtime.get_logger("rocomm.after_stop").ok());
+    CHECK(runtime.stop().ok());
+    CHECK(!runtime.get_logger("rocomm.after_stop").ok());
 
 #ifdef ROCOMM_HAS_SPDLOG_BACKEND
     rocomm::RuntimeConfig default_config;
     default_config.set_shutdown_timeout(std::chrono::seconds(1));
     auto default_runtime_result = rocomm::Runtime::create(std::move(default_config));
-    assert(default_runtime_result.ok());
+    CHECK(default_runtime_result.ok());
     auto default_runtime = std::move(default_runtime_result).value();
-    assert(default_runtime.stop().ok());
+    CHECK(default_runtime.stop().ok());
 #else
     rocomm::RuntimeConfig default_config;
     auto default_runtime_result = rocomm::Runtime::create(std::move(default_config));
-    assert(!default_runtime_result.ok());
-    assert(default_runtime_result.status().code() == rocomm::StatusCode::UnsupportedConfiguration);
+    CHECK(!default_runtime_result.ok());
+    CHECK(default_runtime_result.status().code() == rocomm::StatusCode::UnsupportedConfiguration);
 #endif
     return 0;
 }

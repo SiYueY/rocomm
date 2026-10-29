@@ -5,10 +5,13 @@ target_include_directories(rocomm_runtime
     PUBLIC
         $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>)
-target_link_libraries(rocomm_runtime PUBLIC rocomm::logging)
+if(TARGET rocomm::logging_spdlog)
+    target_link_libraries(rocomm_runtime PUBLIC rocomm::logging_spdlog)
+else()
+    target_link_libraries(rocomm_runtime PUBLIC rocomm::logging)
+endif()
 target_compile_features(rocomm_runtime PUBLIC cxx_std_17)
 
 if(TARGET rocomm::logging_spdlog)
-    target_link_libraries(rocomm_runtime PRIVATE rocomm::logging_spdlog)
     target_compile_definitions(rocomm_runtime PRIVATE ROCOMM_HAS_SPDLOG_BACKEND=1)
 endif()

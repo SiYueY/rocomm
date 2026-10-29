@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -33,7 +34,12 @@ struct Logger::Category {
     std::atomic<std::uint8_t> effective_level;
 };
 
-struct Logger::State : std::enable_shared_from_this<Logger::State> {
+struct Logger::State {
+    struct FlushRequest {
+        std::uint64_t boundary = 0;
+        Status status;
+        bool complete = false;
+    };
     struct WorkItem {
         std::uint64_t token = 0;
         LogRecord record;
@@ -69,9 +75,11 @@ struct Logger::State : std::enable_shared_from_this<Logger::State> {
     LoggingBackendFactory backend_factory;
     std::unique_ptr<LoggingBackend> backend;
 
-    std::mutex mutex;
-    std::condition_variable work_cv;
+    std::timed_mutex mutex;
+    std::condition_variable_any work_cv;
+    std::mutex completion_mutex;
     std::condition_variable completion_cv;
+    std::atomic<bool> shutdown_signal{false};
     LoggingLifecycle lifecycle = LoggingLifecycle::Running;
     std::atomic<std::uint8_t> lifecycle_fast{static_cast<std::uint8_t>(LoggingLifecycle::Running)};
     std::uint64_t next_token = 1;
@@ -82,10 +90,7 @@ struct Logger::State : std::enable_shared_from_this<Logger::State> {
     std::size_t queue_size = 0;
     std::map<std::string, std::shared_ptr<Category>> categories;
     std::map<std::string, LogLevel> overrides;
-    bool flush_requested = false;
-    std::uint64_t flush_boundary = 0;
-    std::uint64_t flushed_boundary = 0;
-    Status flush_status;
+    std::deque<std::shared_ptr<FlushRequest>> flush_requests;
     bool shutdown_requested = false;
     bool shutdown_complete = false;
     Status shutdown_status;
@@ -105,8 +110,9 @@ struct Logger::State : std::enable_shared_from_this<Logger::State> {
     bool pending_through_locked(std::uint64_t token) const noexcept;
     void worker_loop() noexcept;
     void write_record(LogRecord& record) noexcept;
-    void execute_backend_flush() noexcept;
+    Status execute_backend_flush() noexcept;
     void execute_backend_shutdown() noexcept;
+    void complete_worker_exit() noexcept;
     void update_queue_high_watermark(std::size_t size) noexcept;
     LogLevel resolve_level(std::string_view category) const noexcept;
 };

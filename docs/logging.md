@@ -7094,10 +7094,20 @@ TextFormatter
 `rocomm::logging_spdlog`：
 
 ```text
-depends:
-rocomm::logging
-spdlog
+包含：与 rocomm::logging 相同的 Core source + SpdlogBackend source
+依赖：rocomm_core + 固定版本 spdlog
 ```
+
+这是选择 SpdlogBackend 作为默认 Backend 的**完整静态库变体**，不是同时链接
+`rocomm::logging` 和 `rocomm::logging_spdlog` 的增量插件。由于 V1 的默认
+Backend factory 在 `LoggingContext::create()` 中按构建策略静态选择，两个
+target 都包含同一份 LoggingContext/Core 实现源码，但各自只编译和链接自身所需
+的 Backend 依赖。最终 binary **只能选择其中一个**，不得同时链接两个变体导致
+重复符号。它们的 Public API、Logging 语义与 Backend SPI 完全相同。
+
+这种编译期互斥实现避免了全局可变 Backend registry，也确保纯
+`rocomm::logging` 二进制完全不依赖 spdlog。将来若引入新的默认 Backend，
+应重新审查构建策略，不能依赖隐式全局注册。
 
 ---
 

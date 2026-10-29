@@ -1,4 +1,4 @@
-#include <cassert>
+#include "../support/check.hpp"
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -58,20 +58,20 @@ int main() {
         .set_backend_factory(make_backend_factory());
 
     auto context_result = rocomm::logging::LoggingContext::create(std::move(config));
-    assert(context_result.ok());
+    CHECK(context_result.ok());
     auto context = std::move(context_result).value();
     auto logger_result = context.get_logger("rocomm.test");
-    assert(logger_result.ok());
+    CHECK(logger_result.ok());
     auto logger = std::move(logger_result).value();
 
     logger.log(rocomm::logging::LogLevel::Info, "first");
     logger.log_lazy(rocomm::logging::LogLevel::Info, [] { return std::string("second"); });
-    assert(context.flush(std::chrono::seconds(1)).ok());
+    CHECK(context.flush(std::chrono::seconds(1)).ok());
 
     const auto stats = context.get_stats();
-    assert(stats.accepted == 2);
-    assert(stats.dispatched == 2);
-    assert(context.shutdown(std::chrono::seconds(1)).ok());
-    assert(!logger.enabled(rocomm::logging::LogLevel::Info));
+    CHECK(stats.accepted == 2);
+    CHECK(stats.dispatched == 2);
+    CHECK(context.shutdown(std::chrono::seconds(1)).ok());
+    CHECK(!logger.enabled(rocomm::logging::LogLevel::Info));
     return 0;
 }

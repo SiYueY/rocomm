@@ -71,12 +71,12 @@ Status Runtime::stop() noexcept {
     if (!state_) {
         return Status();
     }
+    const auto deadline = deadline_from(state_->shutdown_timeout);
     std::unique_lock<std::mutex> lock(state_->mutex);
     if (state_->stopped) {
         return state_->final_status;
     }
     while (state_->stop_call_active) {
-        const auto deadline = deadline_from(state_->shutdown_timeout);
         if (!state_->completion_cv.wait_until(
                 lock, deadline, [this] { return state_->stopped || !state_->stop_call_active; })) {
             return Status(StatusCode::Timeout);
@@ -88,7 +88,10 @@ Status Runtime::stop() noexcept {
     state_->stopping = true;
     state_->stop_call_active = true;
     lock.unlock();
-    const Status result = state_->logging_context.shutdown(state_->shutdown_timeout);
+    const auto now = std::chrono::steady_clock::now();
+    const Duration remaining =
+        now >= deadline ? Duration::zero() : std::chrono::duration_cast<Duration>(deadline - now);
+    const Status result = state_->logging_context.shutdown(remaining);
     lock.lock();
     state_->stop_call_active = false;
     if (result.code() == StatusCode::Timeout) {

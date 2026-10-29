@@ -63,13 +63,16 @@ public:
                         if constexpr (std::is_same_v<Config, ConsoleOutputConfig>) {
                             const bool stdout_stream = config.stream == ConsoleStream::Stdout;
                             const bool color = config.color != ColorMode::Never;
+                            const auto color_mode = config.color == ColorMode::Always
+                                                        ? ::spdlog::color_mode::always
+                                                        : ::spdlog::color_mode::automatic;
                             if (color) {
                                 if (stdout_stream) {
-                                    sink =
-                                        std::make_shared<::spdlog::sinks::stdout_color_sink_mt>();
+                                    sink = std::make_shared<::spdlog::sinks::stdout_color_sink_mt>(
+                                        color_mode);
                                 } else {
-                                    sink =
-                                        std::make_shared<::spdlog::sinks::stderr_color_sink_mt>();
+                                    sink = std::make_shared<::spdlog::sinks::stderr_color_sink_mt>(
+                                        color_mode);
                                 }
                             } else {
                                 if (stdout_stream) {
@@ -94,9 +97,9 @@ public:
             logger_ =
                 std::make_unique<::spdlog::logger>("rocomm-local", sinks.begin(), sinks.end());
             logger_->set_level(::spdlog::level::trace);
-            logger_->set_pattern("%v");
+            logger_->set_pattern("%^%v%$");
             logger_->set_error_handler([this](const std::string&) {
-                stats_.write_errors.fetch_add(1, std::memory_order_relaxed);
+                error_events_.fetch_add(1, std::memory_order_relaxed);
             });
             initialized_ = true;
             return {};
@@ -108,6 +111,7 @@ public:
     }
 
     void write(const LogRecord& record) noexcept override {
+        stats_.write_calls.fetch_add(1, std::memory_order_relaxed);
         if (!initialized_ || stopped_ || !logger_) {
             stats_.write_errors.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -117,9 +121,12 @@ public:
             stats_.write_errors.fetch_add(1, std::memory_order_relaxed);
             return;
         }
+        const auto errors_before = error_events_.load(std::memory_order_relaxed);
         try {
-            stats_.write_calls.fetch_add(1, std::memory_order_relaxed);
             logger_->log(to_spdlog_level(record.level()), "{}", rendered);
+            if (error_events_.load(std::memory_order_relaxed) != errors_before) {
+                stats_.write_errors.fetch_add(1, std::memory_order_relaxed);
+            }
         } catch (...) {
             stats_.write_errors.fetch_add(1, std::memory_order_relaxed);
         }
@@ -127,11 +134,16 @@ public:
 
     Status flush() noexcept override {
         if (!initialized_ || stopped_ || !logger_) {
-            ++stats_.flush_errors;
+            stats_.flush_errors.fetch_add(1, std::memory_order_relaxed);
             return Status(StatusCode::InvalidState);
         }
+        const auto errors_before = error_events_.load(std::memory_order_relaxed);
         try {
             logger_->flush();
+            if (error_events_.load(std::memory_order_relaxed) != errors_before) {
+                stats_.flush_errors.fetch_add(1, std::memory_order_relaxed);
+                return Status(StatusCode::InternalError);
+            }
             return {};
         } catch (...) {
             stats_.flush_errors.fetch_add(1, std::memory_order_relaxed);
@@ -146,8 +158,13 @@ public:
         stopped_ = true;
         Status result;
         if (logger_) {
+            const auto errors_before = error_events_.load(std::memory_order_relaxed);
             try {
                 logger_->flush();
+                if (error_events_.load(std::memory_order_relaxed) != errors_before) {
+                    stats_.shutdown_errors.fetch_add(1, std::memory_order_relaxed);
+                    result = Status(StatusCode::InternalError);
+                }
             } catch (...) {
                 stats_.shutdown_errors.fetch_add(1, std::memory_order_relaxed);
                 result = Status(StatusCode::InternalError);
@@ -178,6 +195,7 @@ private:
     TextFormatter formatter_;
     std::unique_ptr<::spdlog::logger> logger_;
     AtomicStats stats_;
+    std::atomic<std::uint64_t> error_events_{0};
     bool initialized_ = false;
     bool stopped_ = false;
     Status shutdown_status_;
@@ -186,7 +204,8 @@ private:
 }  // namespace
 
 Result<std::unique_ptr<LoggingBackend>> create_backend(TextBackendConfig config) {
-    if (config.outputs.empty()) {
+    if (config.outputs.empty() || (config.format.timezone != LogTimeZone::Local &&
+                                   config.format.timezone != LogTimeZone::Utc)) {
         return Status(StatusCode::InvalidArgument);
     }
     for (const TextOutputConfig& output : config.outputs) {
@@ -203,6 +222,12 @@ Result<std::unique_ptr<LoggingBackend>> create_backend(TextBackendConfig config)
                     return !value.path.empty() && value.max_file_size_bytes != 0U &&
                            value.max_archived_files != 0U;
                 }
+                if constexpr (std::is_same_v<Config, ConsoleOutputConfig>) {
+                    return (value.stream == ConsoleStream::Stdout ||
+                            value.stream == ConsoleStream::Stderr) &&
+                           (value.color == ColorMode::Auto || value.color == ColorMode::Always ||
+                            value.color == ColorMode::Never);
+                }
                 return true;
             },
             output);
@@ -211,7 +236,7 @@ Result<std::unique_ptr<LoggingBackend>> create_backend(TextBackendConfig config)
         }
     }
     try {
-        return std::unique_ptr<LoggingBackend>(new SpdlogBackend(std::move(config)));
+        return std::unique_ptr<LoggingBackend>(std::make_unique<SpdlogBackend>(std::move(config)));
     } catch (const std::bad_alloc&) {
         return Status(StatusCode::ResourceExhausted);
     } catch (...) {

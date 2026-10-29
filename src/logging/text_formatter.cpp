@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <ctime>
 #include <functional>
+#include <iomanip>
 #include <sstream>
 
 namespace rocomm::logging {
@@ -31,10 +32,17 @@ const char* level_name(LogLevel level) noexcept {
 }
 
 bool make_calendar_time(std::time_t value, LogTimeZone timezone, std::tm& calendar_time) noexcept {
+#if defined(_WIN32)
+    if (timezone == LogTimeZone::Utc) {
+        return gmtime_s(&calendar_time, &value) == 0;
+    }
+    return localtime_s(&calendar_time, &value) == 0;
+#else
     if (timezone == LogTimeZone::Utc) {
         return gmtime_r(&value, &calendar_time) != nullptr;
     }
     return localtime_r(&value, &calendar_time) != nullptr;
+#endif
 }
 
 }  // namespace
@@ -59,7 +67,8 @@ bool TextFormatter::format(const LogRecord& record, std::string& output) noexcep
             const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
                                     timestamp.time_since_epoch()) %
                                 std::chrono::seconds(1);
-            stream << date_buffer << '.' << micros.count();
+            stream << date_buffer << '.' << std::setw(6) << std::setfill('0') << micros.count()
+                   << std::setfill(' ');
             if (config_.timezone == LogTimeZone::Utc) {
                 stream << 'Z';
             } else {

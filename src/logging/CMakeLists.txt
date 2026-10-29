@@ -39,13 +39,27 @@ if(ROCOMM_BUILD_LOGGING_SPDLOG)
         unset(CMAKE_BUILD_TYPE)
     endif()
 
-    target_sources(rocomm_logging PRIVATE spdlog/spdlog_backend.cpp)
-    target_include_directories(rocomm_logging PRIVATE ${PROJECT_SOURCE_DIR}/src/logging)
-    target_link_libraries(rocomm_logging PRIVATE spdlog::spdlog)
-    target_compile_definitions(rocomm_logging PRIVATE ROCOMM_HAS_SPDLOG_BACKEND=1)
-
-    add_library(rocomm_logging_spdlog INTERFACE)
+    # Build a separate fully linked variant for the default spdlog policy.
+    # The base rocomm::logging target remains entirely third-party-free.
+    # These are mutually exclusive implementation variants: do not link both
+    # into the same final binary, because each owns the LoggingContext symbols.
+    add_library(rocomm_logging_spdlog
+        logging_context.cpp
+        raw_log.cpp
+        text_formatter.cpp
+        spdlog/spdlog_backend.cpp)
     add_library(rocomm::logging_spdlog ALIAS rocomm_logging_spdlog)
-    target_link_libraries(rocomm_logging_spdlog INTERFACE rocomm::logging)
-    target_compile_definitions(rocomm_logging_spdlog INTERFACE ROCOMM_HAS_SPDLOG_BACKEND=1)
+    target_include_directories(rocomm_logging_spdlog
+        PUBLIC
+            $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:include>
+        PRIVATE ${PROJECT_SOURCE_DIR}/src/logging)
+    target_link_libraries(rocomm_logging_spdlog
+        PUBLIC rocomm_core
+        PRIVATE spdlog::spdlog)
+    target_compile_features(rocomm_logging_spdlog PUBLIC cxx_std_17)
+    target_compile_definitions(rocomm_logging_spdlog
+        PRIVATE ROCOMM_HAS_SPDLOG_BACKEND=1
+        PUBLIC ROCOMM_LOGGING_COMPILED_LEVEL=${ROCOMM_LOGGING_COMPILED_LEVEL})
+
 endif()
